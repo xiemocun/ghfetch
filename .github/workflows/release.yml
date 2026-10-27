@@ -45,7 +45,7 @@ jobs:
               # that refuses the revoked eMudhra chains (GO-2026-6809). Fail the
               # release rather than ship a verifier that trusts them.
               if [ "$goos" = linux ] && [ "$goarch" = amd64 ]; then
-                recorded="$(go version -m stage/ghfetch | awk '{print $2}')"
+                recorded="$(go version -m stage/ghfetch | awk 'NR==1{print $2}')"
                 if [ "$(printf '%s\n%s\n' "go1.27.3" "$recorded" | sort -V | head -1)" != "go1.27.3" ]; then
                   echo "::error::built with ${recorded}, need >= go1.27.3 for the revoked-CA denylist (GO-2026-6809)"
                   exit 1
