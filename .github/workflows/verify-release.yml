@@ -1,0 +1,54 @@
+name: verify-release
+
+# Audit the release *after* it is published, which release.yml cannot do: at
+# build time the assets are not uploaded yet, so the provenance users depend on
+# is never checked until someone installs it and fails.
+#
+# aquaproj/aqua v2.65.0 shipped without its provenance file and only learned
+# from a user hitting the fail-closed verifier (aquaproj/aqua#5492). For us that
+# failure mode is worse: `--attestation=required` refuses to install.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to audit (e.g. v0.8.4)
+        required: false
+  schedule:
+    # Weekly drift check: an immutable release should look the same next Monday.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve the tag to audit
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-${INPUT_TAG:-}}"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+          [ -n "$tag" ] || { echo '::error::could not determine a tag to audit'; exit 1; }
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "auditing $tag"
+
+      - name: audit assets, checksums and provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # On a GitHub runner the origin is fast; the mirror only exists for
+          # the constrained networks users are on. Empty means "no mirror".
+          VERIFY_RELEASE_MIRROR: ''
+        run: ./scripts/verify-release.sh "${{ steps.tag.outputs.tag }}"

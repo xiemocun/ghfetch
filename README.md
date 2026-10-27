@@ -332,7 +332,18 @@ public issue. Bugs and feature requests have a form under
 $ go test ./...
 $ go vet ./...
 $ go build .
+$ scripts/verify-release.sh v0.8.4   # audit a published release
 ```
+
+`scripts/verify-release.sh` is aimed at the published result rather than the
+build: it requires the release to be immutable, checks that all seven assets are
+there, downloads each one, and compares it against both the digest GitHub
+records and the checksums file. Then it parses the provenance report and requires
+every asset's digest *and* the source repository to match — an exit status alone
+is not evidence, because `gh attestation verify` has returned 0 for a missing
+attestation in some versions. `verify-release.yml` runs it on every published
+release and weekly, so a release that loses its provenance is caught by us
+instead of by a user who cannot install.
 
 The tests read `.github/ISSUE_TEMPLATE/*.yml` and `SECURITY.md` as data, so
 those files are checked by `go test` rather than by memory: an issue form with a

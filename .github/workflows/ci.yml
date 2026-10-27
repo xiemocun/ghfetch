@@ -30,6 +30,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: go test -race ./...
 
+  scripts:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # verify-release.sh is the only thing standing between a silently broken
+      # release and the users whose verifier fails closed.
+      - run: shellcheck scripts/*.sh
+
   build:
     name: cross-compile
     runs-on: ubuntu-latest
