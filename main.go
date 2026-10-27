@@ -29,7 +29,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.6.0"
+var version = "0.7.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -78,8 +78,9 @@ INSTALL FLAGS
   --dest <dir>         install directory (default: /usr/local/bin, else ~/.local/bin)
   --source <list>      comma separated mirror prefixes, "direct" to skip mirrors
   --require-checksum   fail when the release publishes no checksum file
-  --verify-attestation verify SLSA build provenance with the gh CLI
-  --require-attestation fail unless build provenance verifies
+  --attestation <policy>  SLSA provenance policy: off, optional or required
+  --verify-attestation alias for --attestation=optional
+  --require-attestation alias for --attestation=required
   --dry-run            resolve and print the plan, install nothing
   --json               machine readable report on stdout
 
@@ -96,8 +97,9 @@ func cmdInstall(args []string) error {
 	exact := fs.String("to", "", "exact asset filename")
 	sourceList := fs.String("source", "", "comma separated mirror prefixes")
 	needSum := fs.Bool("require-checksum", false, "fail when no checksum file is published")
-	verifyAtt := fs.Bool("verify-attestation", false, "also verify SLSA build provenance with the gh CLI")
-	requireAtt := fs.Bool("require-attestation", false, "fail unless build provenance verifies")
+	attPolicy := fs.String("attestation", "", "SLSA provenance policy: off, optional or required")
+	verifyAtt := fs.Bool("verify-attestation", false, "alias for --attestation=optional")
+	requireAtt := fs.Bool("require-attestation", false, "alias for --attestation=required")
 	dryRun := fs.Bool("dry-run", false, "resolve only, install nothing")
 	asJSON := fs.Bool("json", false, "emit a machine readable report on stdout")
 	positional, err := parseInterspersed(fs, args)
@@ -106,6 +108,12 @@ func cmdInstall(args []string) error {
 	}
 	if len(positional) != 1 {
 		return errors.New("usage: ghfetch install <owner/repo>[@tag]")
+	}
+	// Resolve the provenance policy before touching the network: a typo in
+	// --attestation should not cost an API round trip.
+	attMode, err := resolveAttestationMode(*attPolicy, *verifyAtt, *requireAtt)
+	if err != nil {
+		return err
 	}
 
 	repo, tag, err := splitSpec(positional[0])
@@ -154,6 +162,10 @@ func cmdInstall(args []string) error {
 	report := installReport{
 		Repo: repo, Tag: rel.Tag, Asset: asset.Name, Size: asset.Size,
 		Binary: want, Dest: installDir,
+		// --json consumers must never have to read an empty attestation field
+		// and guess whether verification ran: "skipped" is stated up front and
+		// only an actual verification pass overwrites it.
+		Attestation: attestationSkipped, AttestationMode: attMode.String(),
 	}
 	if *dryRun {
 		report.DryRun = true
@@ -185,13 +197,14 @@ func cmdInstall(args []string) error {
 	}
 	report.Verified = method
 
-	if *verifyAtt || *requireAtt {
-		attestation, err := verifyAttestation(ctx, repo, data, report.SHA256, *requireAtt)
-		if err != nil {
-			return err
-		}
-		report.Attestation = attestation
+	// Called even when the policy is off: verifyAttestation returns immediately
+	// with "skipped" so the report always carries one of the three statuses.
+	status, detail, err := verifyAttestation(ctx, repo, data, report.SHA256, attMode)
+	if err != nil {
+		return err
 	}
+	report.Attestation = status
+	report.AttestationDetail = detail
 
 	picked, body, mode, err := archive.Extract(data, asset.Name, want)
 	if err != nil && errors.Is(err, archive.ErrNotFound) {
@@ -316,30 +329,36 @@ func verify(ctx context.Context, chain *source.Chain, rel *ghrelease.Release, as
 // to stderr, so a wrapper that only reads the exit code reports "verified" for
 // an artifact nobody ever attested. The JSON report is parsed instead, and the
 // attested subject digest must equal the digest of the bytes we downloaded.
-func verifyAttestation(ctx context.Context, repo string, data []byte, digest string, require bool) (string, error) {
-	ghBin, err := exec.LookPath("gh")
-	if err != nil {
-		if require {
-			return "", errors.New("gh CLI not found in PATH; install it to verify build provenance")
-		}
-		fmt.Fprintln(os.Stderr, "warning: gh CLI not found, skipping provenance verification")
-		return "", nil
+//
+// The policy decides what a negative result costs, never whether it is visible.
+// The returned status is always one of verified, skipped or failed, so a caller
+// that only reads the value can tell "not requested" from "requested and not
+// proved". Returning "" for both, as 0.6.0 did, made a downgraded check
+// indistinguishable from no check at all.
+func verifyAttestation(ctx context.Context, repo string, data []byte, digest string, mode attestationMode) (status, detail string, err error) {
+	if mode == attestationOff {
+		return attestationSkipped, "", nil
+	}
+
+	ghBin, lookErr := exec.LookPath("gh")
+	if lookErr != nil {
+		return attestationOutcome(repo, mode, "gh CLI not found in PATH; install it to verify build provenance")
 	}
 
 	// gh matches attestations by the subject's digest, so the file name is
 	// irrelevant; the bytes are exactly the release asset.
 	tmp, err := os.CreateTemp("", "ghfetch-attest-*")
 	if err != nil {
-		return "", fmt.Errorf("create temp file for attestation check: %w", err)
+		return attestationFailed, err.Error(), fmt.Errorf("create temp file for attestation check: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, werr := tmp.Write(data); werr != nil {
 		tmp.Close()
-		return "", fmt.Errorf("write temp file for attestation check: %w", werr)
+		return attestationFailed, werr.Error(), fmt.Errorf("write temp file for attestation check: %w", werr)
 	}
 	if cerr := tmp.Close(); cerr != nil {
-		return "", fmt.Errorf("close temp file for attestation check: %w", cerr)
+		return attestationFailed, cerr.Error(), fmt.Errorf("close temp file for attestation check: %w", cerr)
 	}
 
 	cmd := exec.CommandContext(ctx, ghBin, "attestation", "verify", tmpName, "--repo", repo, "--format", "json")
@@ -350,23 +369,116 @@ func verifyAttestation(ctx context.Context, repo string, data []byte, digest str
 	problem := ""
 	switch {
 	case runErr != nil:
-		problem = firstLine(stderr.String())
-		if problem == "no output" {
-			problem = runErr.Error()
-		}
+		problem = attestationProblem(stderr.String(), runErr)
 	case !attestationCovers(out, digest, repo):
 		problem = "no attestation covers this digest for " + repo
 	}
 	if problem != "" {
-		if require {
-			return "", fmt.Errorf("build provenance did not verify for %s: %s", repo, problem)
-		}
-		fmt.Fprintf(os.Stderr, "warning: build provenance did not verify for %s (%s)\n", repo, problem)
-		return "", nil
+		return attestationOutcome(repo, mode, problem)
 	}
 
 	fmt.Fprintf(os.Stderr, "build provenance verified (gh attestation, %s)\n", repo)
-	return "verified", nil
+	return attestationVerified, "", nil
+}
+
+// attestationProblem reduces the verifier's complaint to something a user can
+// read in a --json field or a one-line warning. gh prints the whole API URL for
+// a 404 on the attestations endpoint, which is noise: the meaning is that the
+// project publishes no provenance for this digest.
+func attestationProblem(stderrOut string, runErr error) string {
+	if strings.Contains(stderrOut, "HTTP 404") {
+		return "no attestations published for this digest (HTTP 404)"
+	}
+	problem := firstLine(stderrOut)
+	if problem == "no output" {
+		problem = firstLine(runErr.Error())
+	}
+	return truncate(problem, 200)
+}
+
+// truncate keeps one line of errno-ish text from dominating the report.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// attestationOutcome turns a verification problem into the triple the caller and
+// --json need. Under the optional policy the install continues but the report
+// says failed; under the required policy it is an error. Neither path returns an
+// empty status, which is the whole point: a skipped check is not a passed check.
+func attestationOutcome(repo string, mode attestationMode, problem string) (string, string, error) {
+	if mode == attestationRequired {
+		return attestationFailed, problem, fmt.Errorf("build provenance did not verify for %s: %s (--attestation=required)", repo, problem)
+	}
+	fmt.Fprintf(os.Stderr, "warning: build provenance did not verify for %s (%s)\n", repo, problem)
+	return attestationFailed, problem, nil
+}
+
+// attestationMode is how hard ghfetch has to try to prove build provenance.
+type attestationMode int
+
+const (
+	attestationOff attestationMode = iota
+	attestationOptional
+	attestationRequired
+)
+
+// The status strings are part of the --json contract and are asserted by tests.
+const (
+	attestationVerified = "verified"
+	attestationSkipped  = "skipped"
+	attestationFailed   = "failed"
+)
+
+func (m attestationMode) String() string {
+	switch m {
+	case attestationOptional:
+		return "optional"
+	case attestationRequired:
+		return "required"
+	default:
+		return "off"
+	}
+}
+
+func parseAttestationMode(s string) (attestationMode, error) {
+	switch s {
+	case "off":
+		return attestationOff, nil
+	case "optional":
+		return attestationOptional, nil
+	case "required":
+		return attestationRequired, nil
+	default:
+		return attestationOff, fmt.Errorf("unknown attestation policy %q, want off, optional or required", s)
+	}
+}
+
+// resolveAttestationMode folds --attestation and the two legacy boolean flags
+// into one policy. The legacy flags are aliases, and the stricter request wins:
+// a script that passes both --attestation=off and --require-attestation must not
+// lose the check it asked for just because of argument order.
+func resolveAttestationMode(policy string, verify, require bool) (attestationMode, error) {
+	mode := attestationOff
+	if verify {
+		mode = attestationOptional
+	}
+	if require {
+		mode = attestationRequired
+	}
+	if policy == "" {
+		return mode, nil
+	}
+	parsed, err := parseAttestationMode(policy)
+	if err != nil {
+		return attestationOff, err
+	}
+	if parsed > mode {
+		return parsed, nil
+	}
+	return mode, nil
 }
 
 // attestationCovers reports whether the verifier's JSON report contains at least
@@ -476,19 +588,23 @@ func installBinary(dir, name string, body []byte, mode os.FileMode) (string, err
 // installReport, listReport and friends are the machine readable output of
 // --json. Field names are snake_case because shell and CI consumers read them.
 type installReport struct {
-	Repo        string   `json:"repo"`
-	Tag         string   `json:"tag"`
-	Asset       string   `json:"asset"`
-	Size        int64    `json:"size"`
-	Binary      string   `json:"binary"`
-	Dest        string   `json:"dest"`
-	Installed   string   `json:"installed,omitempty"`
-	Source      string   `json:"source,omitempty"`
-	SHA256      string   `json:"sha256,omitempty"`
-	Verified    string   `json:"verified,omitempty"`
-	Attestation string   `json:"attestation,omitempty"`
-	Candidates  []string `json:"candidates,omitempty"`
-	DryRun      bool     `json:"dry_run,omitempty"`
+	Repo      string `json:"repo"`
+	Tag       string `json:"tag"`
+	Asset     string `json:"asset"`
+	Size      int64  `json:"size"`
+	Binary    string `json:"binary"`
+	Dest      string `json:"dest"`
+	Installed string `json:"installed,omitempty"`
+	Source    string `json:"source,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Verified  string `json:"verified,omitempty"`
+	// Attestation is always present and is one of verified, skipped or failed.
+	// An empty value would mean "the caller has to guess".
+	Attestation       string   `json:"attestation"`
+	AttestationMode   string   `json:"attestation_mode"`
+	AttestationDetail string   `json:"attestation_detail,omitempty"`
+	Candidates        []string `json:"candidates,omitempty"`
+	DryRun            bool     `json:"dry_run,omitempty"`
 }
 
 type hostReport struct {

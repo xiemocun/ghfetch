@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,12 +52,33 @@ func attestationJSONFor(sourceRepo, digest string) string {
 
 func TestVerifyAttestationVerified(t *testing.T) {
 	fakeGH(t, attestationJSON(testDigest), "", 0)
-	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
+	status, detail, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "verified" {
-		t.Errorf("got %q, want \"verified\"", got)
+	if status != attestationVerified {
+		t.Errorf("got %q, want %q", status, attestationVerified)
+	}
+	if detail != "" {
+		t.Errorf("a verified result should carry no detail, got %q", detail)
+	}
+}
+
+// TestVerifyAttestationOffIsSkippedNotEmpty pins the --json contract: "off" is
+// reported as skipped, and skipping never shells out to gh.
+func TestVerifyAttestationOffIsSkippedNotEmpty(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Setenv("PATH", t.TempDir()+string(os.PathListSeparator)+"/nonexistent")
+	}
+	status, detail, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationOff)
+	if err != nil {
+		t.Fatalf("off must not error even without gh: %v", err)
+	}
+	if status != attestationSkipped {
+		t.Errorf("got %q, want %q", status, attestationSkipped)
+	}
+	if detail != "" {
+		t.Errorf("got detail %q, want none", detail)
 	}
 }
 
@@ -64,7 +87,7 @@ func TestVerifyAttestationVerified(t *testing.T) {
 // answers 404, so the exit status alone must never be read as success.
 func TestVerifyAttestationIgnoresZeroExitOn404(t *testing.T) {
 	fakeGH(t, "", "Error: HTTP 404: Not Found (https://api.github.com/repos/owner/repo/attestations/sha256:...)", 0)
-	_, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
+	_, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired)
 	if err == nil {
 		t.Fatal("a zero exit with no attestation report must not count as verified")
 	}
@@ -72,28 +95,28 @@ func TestVerifyAttestationIgnoresZeroExitOn404(t *testing.T) {
 
 func TestVerifyAttestationRejectsEmptyReport(t *testing.T) {
 	fakeGH(t, "[]", "", 0)
-	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+	if _, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired); err == nil {
 		t.Fatal("an empty attestation list must not verify")
 	}
 }
 
 func TestVerifyAttestationRejectsDigestMismatch(t *testing.T) {
 	fakeGH(t, attestationJSON(strings.Repeat("0", 64)), "", 0)
-	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+	if _, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired); err == nil {
 		t.Fatal("an attestation for another digest must not verify this artifact")
 	}
 }
 
 func TestVerifyAttestationRejectsNonJSON(t *testing.T) {
 	fakeGH(t, "verification succeeded\n", "", 0)
-	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+	if _, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired); err == nil {
 		t.Fatal("unparseable verifier output must not verify")
 	}
 }
 
 func TestVerifyAttestationFailureIsFatalWhenRequired(t *testing.T) {
 	fakeGH(t, "", "no attestations found for subject\n", 1)
-	_, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
+	_, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -105,14 +128,20 @@ func TestVerifyAttestationFailureIsFatalWhenRequired(t *testing.T) {
 	}
 }
 
-func TestVerifyAttestationFailureIsWarningWhenOptional(t *testing.T) {
+// TestVerifyAttestationFailureIsVisibleWhenOptional is the regression test for
+// the silent downgrade: the install still succeeds, but the result must say
+// failed and carry the reason, not come back empty.
+func TestVerifyAttestationFailureIsVisibleWhenOptional(t *testing.T) {
 	fakeGH(t, "", "no attestations found for subject\n", 1)
-	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, false)
+	status, detail, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationOptional)
 	if err != nil {
 		t.Fatalf("optional verification must not fail the install: %v", err)
 	}
-	if got != "" {
-		t.Errorf("got %q, want an empty result", got)
+	if status != attestationFailed {
+		t.Errorf("got %q, want %q — an unproven artifact must not look like an unchecked one", status, attestationFailed)
+	}
+	if !strings.Contains(detail, "no attestations found") {
+		t.Errorf("detail %q should carry the verifier's reason", detail)
 	}
 }
 
@@ -123,14 +152,148 @@ func TestVerifyAttestationWithoutGH(t *testing.T) {
 	// A directory with no gh in it, and no fallback entry that holds one either.
 	t.Setenv("PATH", t.TempDir()+string(os.PathListSeparator)+"/nonexistent")
 
-	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+	if _, _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationRequired); err == nil {
 		t.Fatal("required provenance must fail when gh is missing")
 	} else if !strings.Contains(err.Error(), "gh CLI not found") {
 		t.Errorf("error should say gh is missing, got: %v", err)
 	}
 
-	if got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, false); err != nil || got != "" {
-		t.Errorf("optional provenance with no gh = %q, %v; want \"\", nil", got, err)
+	// Optional and gh missing is a downgrade, so it has to read as failed.
+	status, detail, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, attestationOptional)
+	if err != nil {
+		t.Errorf("optional provenance with no gh must not fail the install: %v", err)
+	}
+	if status != attestationFailed {
+		t.Errorf("got %q, want %q: a check that could not run is not a check that passed", status, attestationFailed)
+	}
+	if !strings.Contains(detail, "gh CLI not found") {
+		t.Errorf("detail %q should say gh is missing", detail)
+	}
+}
+
+func TestResolveAttestationMode(t *testing.T) {
+	cases := []struct {
+		name            string
+		policy          string
+		verify, require bool
+		want            attestationMode
+		wantErr         bool
+	}{
+		{"no flags", "", false, false, attestationOff, false},
+		{"legacy verify", "", true, false, attestationOptional, false},
+		{"legacy require", "", false, true, attestationRequired, false},
+		{"both legacy flags", "", true, true, attestationRequired, false},
+		{"policy off", "off", false, false, attestationOff, false},
+		{"policy optional", "optional", false, false, attestationOptional, false},
+		{"policy required", "required", false, false, attestationRequired, false},
+		{"policy cannot weaken legacy verify", "off", true, false, attestationOptional, false},
+		{"policy cannot weaken legacy require", "optional", false, true, attestationRequired, false},
+		{"stricter policy wins", "required", true, false, attestationRequired, false},
+		{"bogus policy", "maybe", false, false, attestationOff, true},
+		{"bogus policy beats legacy flags", "maybe", false, true, attestationOff, true},
+	}
+	for _, c := range cases {
+		got, err := resolveAttestationMode(c.policy, c.verify, c.require)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected an error", c.name)
+			} else if !strings.Contains(err.Error(), "off, optional or required") {
+				t.Errorf("%s: error %q should list the accepted policies", c.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", c.name, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: resolveAttestationMode = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestAttestationModeString(t *testing.T) {
+	cases := map[attestationMode]string{
+		attestationOff:      "off",
+		attestationOptional: "optional",
+		attestationRequired: "required",
+	}
+	for mode, want := range cases {
+		if got := mode.String(); got != want {
+			t.Errorf("attestationMode(%d).String() = %q, want %q", int(mode), got, want)
+		}
+	}
+	// Round trip: the JSON policy name must be accepted by the parser.
+	for mode, name := range cases {
+		if got, err := parseAttestationMode(name); err != nil || got != mode {
+			t.Errorf("parseAttestationMode(%q) = %v, %v; want %v", name, got, err, mode)
+		}
+	}
+}
+
+// TestAttestationJSONHasNoEmptyState pins the --json contract that 0.6.0 broke:
+// attestation is never omitted and never empty, so a pipeline can branch on it.
+func TestAttestationJSONHasNoEmptyState(t *testing.T) {
+	cases := []struct {
+		name string
+		in   installReport
+		want string
+	}{
+		{"off", installReport{Repo: "owner/repo", Attestation: attestationSkipped, AttestationMode: attestationOff.String()}, "skipped"},
+		{"optional failed", installReport{Repo: "owner/repo", Attestation: attestationFailed, AttestationMode: attestationOptional.String(), AttestationDetail: "gh CLI not found"}, "failed"},
+		{"required verified", installReport{Repo: "owner/repo", Attestation: attestationVerified, AttestationMode: attestationRequired.String()}, "verified"},
+	}
+	for _, c := range cases {
+		data, err := json.Marshal(c.in)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		state, ok := got["attestation"]
+		if !ok {
+			t.Fatalf("%s: attestation key missing from %s", c.name, data)
+		}
+		if state != c.want {
+			t.Errorf("%s: attestation = %v, want %q", c.name, state, c.want)
+		}
+		if _, ok := got["attestation_mode"]; !ok {
+			t.Errorf("%s: attestation_mode missing from %s", c.name, data)
+		}
+		if c.want == "failed" && got["attestation_detail"] == nil {
+			t.Errorf("%s: a failed check must carry its reason, got %s", c.name, data)
+		}
+	}
+}
+
+// TestInstallRejectsUnknownAttestationPolicy keeps a typo from reaching the
+// network, and keeps the error message actionable.
+func TestInstallRejectsUnknownAttestationPolicy(t *testing.T) {
+	if err := run([]string{"install", "owner/repo", "--attestation=maybe"}); err == nil {
+		t.Fatal("an unknown policy must be rejected")
+	} else if !strings.Contains(err.Error(), "off, optional or required") {
+		t.Errorf("error %q should list the accepted policies", err)
+	}
+}
+
+// TestAttestationProblemShortensThe404 keeps the --json detail readable: the
+// raw gh stderr for a missing attestation is a full API URL.
+func TestAttestationProblemShortensThe404(t *testing.T) {
+	raw := "Error: HTTP 404: Not Found (https://api.github.com/repos/BurntSushi/ripgrep/attestations/sha256:" + testDigest + "?per_page=30)\n"
+	got := attestationProblem(raw, errors.New("exit status 1"))
+	if !strings.Contains(got, "no attestations published") || strings.Contains(got, "https://") {
+		t.Errorf("attestationProblem = %q, want the short 404 wording", got)
+	}
+
+	long := strings.Repeat("x", 500)
+	if got := attestationProblem(long, errors.New("exit status 1")); len(got) > 210 {
+		t.Errorf("a long verifier line must be truncated, got %d bytes", len(got))
+	}
+
+	if got := attestationProblem("", errors.New("signal: killed")); got != "signal: killed" {
+		t.Errorf("attestationProblem with no stderr = %q, want the error text", got)
 	}
 }
 

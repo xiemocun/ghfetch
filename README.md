@@ -72,8 +72,9 @@ ghfetch version
 | `--dest <dir>` | install directory (default: `/usr/local/bin`, else `~/.local/bin`) |
 | `--source <list>` | comma-separated mirror prefixes, `direct` to skip mirrors |
 | `--require-checksum` | fail when the release publishes no checksum file |
-| `--verify-attestation` | also verify SLSA build provenance with the `gh` CLI |
-| `--require-attestation` | fail unless build provenance verifies |
+| `--attestation <policy>` | SLSA build provenance: `off` (default), `optional`, `required` |
+| `--verify-attestation` | alias for `--attestation=optional` |
+| `--require-attestation` | alias for `--attestation=required` |
 | `--dry-run` | resolve and print the plan, install nothing |
 | `--json` | print a machine-readable report on stdout |
 
@@ -121,9 +122,15 @@ $ ghfetch install jqlang/jq --json
   "installed": "/tmp/j1/jq",
   "source": "ghfast.top",
   "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
-  "verified": "sha256"
+  "verified": "sha256",
+  "attestation": "skipped",
+  "attestation_mode": "off"
 }
 ```
+
+`attestation` is always present, always one of `verified`, `skipped` or
+`failed`, and `attestation_detail` explains a `failed` — so a pipeline never has
+to guess whether provenance was not requested, attempted and unproven, or proved:
 
 ## Shell completion
 
@@ -157,16 +164,27 @@ release upload passes a checksum happily.
 $ ghfetch install xiemocun/ghfetch --require-checksum
 
 # 2. SLSA build provenance, verified by `gh attestation verify`
-$ ghfetch install xiemocun/ghfetch --require-attestation
+$ ghfetch install xiemocun/ghfetch --attestation=required   # or --require-attestation
+
+# prove it in CI, but still install when the project does not attest
+$ ghfetch install BurntSushi/ripgrep --attestation=optional --json | jq -r .attestation
+failed
 ```
+
+`--attestation` is the whole policy in one flag: `off` (default) never runs the
+verifier, `optional` runs it and reports the result without failing the install,
+`required` fails the install when provenance does not verify. `--verify-attestation`
+and `--require-attestation` remain as aliases for `optional` and `required`, and
+when both forms are given the stricter one wins — a script cannot lose a check it
+asked for because of argument order.
 
 Provenance verification is delegated to `gh attestation verify` rather than
 reimplemented: that command already ships Sigstore's trust roots, the Rekor
 lookup and the bundle format, and it is the verifier GitHub documents. Vendoring
 a TUF root store into a release installer would add more trust surface than the
 installer is worth. The trade-off is a dependency on `gh` (2.49+) for this one
-flag; without it, `--verify-attestation` warns and `--require-attestation`
-fails.
+flag; without it, `--attestation=optional` warns and reports `failed`, while
+`--attestation=required` stops the install.
 
 Its exit status is not trusted on its own. `gh attestation verify` exits 0 when
 the attestations API answers 404 for a digest, printing the HTTP error to
