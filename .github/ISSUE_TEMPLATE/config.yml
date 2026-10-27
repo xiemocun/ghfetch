@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem (private)
+    url: https://github.com/xiemocun/ghfetch/security/advisories/new
+    about: Wrong bytes accepted, a checksum bypassed, or a mirror trusted when it should not be — please use a private advisory, not a public issue.
+  - name: Why the source selector judges throughput, not reachability
+    url: https://github.com/xiemocun/ghfetch/blob/main/docs/why-speed-not-connectivity.md
+    about: The measurements behind the mirror chain, if an install feels slow or falls back to a source you did not expect.

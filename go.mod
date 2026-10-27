@@ -10,4 +10,9 @@ go 1.23
 // Guarded by TestToolchainPinsRevokedCAFix in toolchain_test.go.
 toolchain go1.27.3
 
-require github.com/ulikunitz/xz v0.5.17
+require (
+	github.com/ulikunitz/xz v0.5.17
+
+	// Test-only: the issue forms are validated as the YAML GitHub will parse.
+	gopkg.in/yaml.v3 v3.0.1
+)

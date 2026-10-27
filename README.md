@@ -309,9 +309,22 @@ $ ghfetch install cli/cli --bin gh
   artifact worth installing has one.
 - **No self-update.** Re-run `install`; a recorded tag is a no-op and a newer
   tag replaces the binary through the same atomic rename.
-- **Mirrors are convenience, not trust.** Every mirror is treated as untrusted
-  transport, which is exactly why the digest is verified after download rather
-  than trusting the transport.
+- **Mirrors are convenience, not trust.** A mirror is untrusted transport and the
+  digest is verified after download — but the checksum file travels the same
+  chain as the asset, so a mirror answering for both can make them agree.
+  `--source direct` keeps the checksum out of a mirror's hands, and
+  `--attestation=required` is the only check a mirror cannot satisfy. What is
+  and is not covered is written down in [SECURITY.md](SECURITY.md).
+
+## Security
+
+The trust boundaries are spelled out in [SECURITY.md](SECURITY.md): what ghfetch
+verifies on its own, what only `--attestation=required` proves, and the known
+gaps (a mirror can serve asset and checksum together; there is no cap on archive
+expansion). Report a vulnerability through the [private advisory
+form](https://github.com/xiemocun/ghfetch/security/advisories/new) rather than a
+public issue. Bugs and feature requests have a form under
+[New issue](https://github.com/xiemocun/ghfetch/issues/new/choose).
 
 ## Development
 
@@ -320,6 +333,13 @@ $ go test ./...
 $ go vet ./...
 $ go build .
 ```
+
+The tests read `.github/ISSUE_TEMPLATE/*.yml` and `SECURITY.md` as data, so
+those files are checked by `go test` rather than by memory: an issue form with a
+duplicated `id` is dropped by GitHub without an error, and a padding edit that
+quietly softens the security policy fails
+`TestSecurityPolicyStaysHonest`. `gopkg.in/yaml.v3` is a test dependency; the
+binary has none.
 
 CI runs the tests on Linux, macOS and Windows plus a cross-compile matrix on
 every push.

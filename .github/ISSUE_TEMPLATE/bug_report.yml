@@ -1,0 +1,73 @@
+name: Bug report
+description: An install failed, or installed something that does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before pasting output: `--json` and `--dry-run` reports never contain a token,
+        but a log that includes an environment dump might. Redact `GH_TOKEN` and
+        `GITHUB_TOKEN` values.
+
+        Security problems (wrong bytes accepted, checksum bypassed, a mirror
+        trusted when it should not be) go through
+        [SECURITY.md](https://github.com/xiemocun/ghfetch/blob/main/SECURITY.md),
+        not this form.
+  - type: input
+    id: version
+    attributes:
+      label: ghfetch version
+      description: Output of `ghfetch version`.
+      placeholder: ghfetch 0.8.3 (go1.27.3, linux/amd64)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      description: For example `linux/amd64`, `macOS 15 arm64`, `Windows 11 amd64`.
+      placeholder: linux/amd64
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command
+      description: Copy the whole invocation, including flags and the tag.
+      render: console
+      placeholder: ghfetch install cli/cli@v2.103.3 --require-checksum
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: The full output, or the `--json` report if you used it.
+      render: console
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: Resolved plan, if you have it
+      description: >
+        Output of `ghfetch install <repo> --dry-run` or `ghfetch list <repo>`,
+        when the problem is that the wrong asset was chosen.
+      render: console
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues for this failure.
+          required: true
+        - label: This is not a security report (those go to SECURITY.md, privately).
+          required: true

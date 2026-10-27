@@ -1,0 +1,42 @@
+name: Feature request
+description: Something ghfetch makes harder than it should be
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `ghfetch` is deliberately small: install, verify, and get out of the way.
+        Requests are weighed by whether someone is actually blocked, so the most
+        useful thing you can write is the situation that hit you — not the flag
+        you would like to see.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do, and where does it break?
+      description: >
+        Describe the machine, the script or the pipeline, and the point where
+        ghfetch cannot go further. "I want a --foo flag" without the situation
+        behind it is hard to act on.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What do you do instead today?
+      description: The shell loop, the second tool, the manual step — whatever covers the gap now.
+    validations:
+      required: false
+  - type: textarea
+    id: proposal
+    attributes:
+      label: A shape you would accept
+      description: Optional. If you have thought about the interface, sketch it.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I checked the README and the existing issues for this.
+          required: true
