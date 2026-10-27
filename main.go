@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -30,7 +31,35 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.8.0"
+// It is empty for any other build: `go install ...@latest` records the module
+// version in the build info, so resolveVersion can report the real number
+// instead of a constant that starts lying the moment a tag is pushed.
+var version = ""
+
+// resolveVersion picks the version to print. The release build wins; otherwise
+// the module version Go embedded at build time is used, which is what a
+// `go install` binary carries. "(devel)" and an empty string both mean "built
+// from a checkout", reported as "dev" rather than as a version number.
+func resolveVersion(ldflags string, buildInfo *debug.BuildInfo, buildInfoOK bool) string {
+	if v := strings.TrimPrefix(strings.TrimSpace(ldflags), "v"); v != "" {
+		return v
+	}
+	if buildInfoOK && buildInfo != nil {
+		if v := buildInfo.Main.Version; v != "" && v != "(devel)" {
+			return strings.TrimPrefix(v, "v")
+		}
+	}
+	return "dev"
+}
+
+// versionString is the human-readable line printed by `ghfetch version`. The Go
+// version is part of it because the TLS trust store is compiled in: two ghfetch
+// binaries with the same tag can disagree about which CAs to trust.
+func versionString() string {
+	buildInfo, ok := debug.ReadBuildInfo()
+	return fmt.Sprintf("ghfetch %s (%s, %s)",
+		resolveVersion(version, buildInfo, ok), runtime.Version(), platform.Detect())
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -52,7 +81,7 @@ func run(args []string) error {
 	case "completion":
 		return cmdCompletion(args[1:])
 	case "version", "-v", "--version":
-		fmt.Printf("ghfetch %s (%s, %s)\n", version, runtime.Version(), platform.Detect())
+		fmt.Println(versionString())
 		return nil
 	case "help", "-h", "--help":
 		usage()
