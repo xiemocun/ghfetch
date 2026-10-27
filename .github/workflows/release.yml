@@ -24,22 +24,23 @@ jobs:
       - name: build archives
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist stage
           version="${GITHUB_REF_NAME#v}"
           for goos in linux darwin windows; do
             for goarch in amd64 arm64; do
-              out="dist/ghfetch_${goos}_${goarch}"
               ext=""
               if [ "$goos" = "windows" ]; then ext=".exe"; fi
+              # Stage the binary under its plain name so the archive contains
+              # "ghfetch" (or "ghfetch.exe"), not "ghfetch_linux_amd64".
+              rm -rf stage/*
               GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
                 go build -trimpath -ldflags "-s -w -X main.version=${version}" \
-                -o "${out}${ext}" .
+                -o "stage/ghfetch${ext}" .
               if [ "$goos" = "windows" ]; then
-                (cd dist && zip -q "ghfetch_${version}_${goos}_${goarch}.zip" "ghfetch_${goos}_${goarch}${ext}")
+                (cd stage && zip -q "../dist/ghfetch_${version}_${goos}_${goarch}.zip" "ghfetch${ext}")
               else
-                tar -czf "dist/ghfetch_${version}_${goos}_${goarch}.tar.gz" -C dist "ghfetch_${goos}_${goarch}"
+                tar -czf "dist/ghfetch_${version}_${goos}_${goarch}.tar.gz" -C stage "ghfetch"
               fi
-              rm -f "${out}${ext}"
             done
           done
           (cd dist && sha256sum ./* > "ghfetch_${version}_checksums.txt")

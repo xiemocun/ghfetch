@@ -156,9 +156,18 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
-	body, mode, err := archive.Extract(data, asset.Name, want)
+	picked, body, mode, err := archive.Extract(data, asset.Name, want)
+	if err != nil && errors.Is(err, archive.ErrNotFound) {
+		// Repos disagree about the name of the binary inside the archive. Fall
+		// back to the largest executable rather than failing the install.
+		fmt.Fprintf(os.Stderr, "note: %q is not in %s, using the largest executable instead\n", want, asset.Name)
+		picked, body, mode, err = archive.Extract(data, asset.Name, "")
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %w (use --bin to name the executable)", asset.Name, err)
+	}
+	if picked != "" && picked != want {
+		fmt.Fprintf(os.Stderr, "note: archive member %q installed as %q\n", picked, want)
 	}
 
 	installed, err := installBinary(installDir, want, body, mode)

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -67,9 +68,12 @@ func TestExtractTarGzByName(t *testing.T) {
 		{"tool_1.0/README.md", "docs"},
 		{"tool_1.0/tool", "#!/bin/sh\necho hi\n"},
 	})
-	body, mode, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "tool")
+	name, body, mode, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "tool")
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
+	}
+	if name != "tool" {
+		t.Errorf("name = %q", name)
 	}
 	if string(body) != "#!/bin/sh\necho hi\n" {
 		t.Errorf("body = %q", body)
@@ -79,17 +83,33 @@ func TestExtractTarGzByName(t *testing.T) {
 	}
 }
 
+// TestExtractPrefixedName covers binaries renamed with a platform suffix inside
+// the archive, which is what a plain `go build -o ghfetch_linux_amd64` produces.
+func TestExtractPrefixedName(t *testing.T) {
+	blob := tarGz(t, []entry{{"ghfetch_linux_amd64", "binary"}})
+	name, body, _, err := Extract(blob, "ghfetch_0.1.0_linux_amd64.tar.gz", "ghfetch")
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if name != "ghfetch_linux_amd64" || string(body) != "binary" {
+		t.Errorf("picked %q (%q)", name, body)
+	}
+}
+
 func TestExtractTarGzAutoSelect(t *testing.T) {
 	blob := tarGz(t, []entry{
 		{"tool_1.0/README.md", "docs"},
 		{"tool_1.0/tool", "binary-content"},
 	})
-	body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "")
+	name, body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "")
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
 	if string(body) != "binary-content" {
 		t.Errorf("picked %q, want the binary", body)
+	}
+	if name != "tool" {
+		t.Errorf("name = %q", name)
 	}
 }
 
@@ -98,17 +118,17 @@ func TestExtractZip(t *testing.T) {
 		{"tool.exe", "windows-binary"},
 		{"CHANGELOG.md", "notes"},
 	})
-	body, _, err := Extract(blob, "tool_windows_amd64.zip", "tool.exe")
+	name, body, _, err := Extract(blob, "tool_windows_amd64.zip", "tool.exe")
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if string(body) != "windows-binary" {
-		t.Errorf("body = %q", body)
+	if name != "tool.exe" || string(body) != "windows-binary" {
+		t.Errorf("got %q (%q)", name, body)
 	}
 }
 
 func TestExtractRawBinary(t *testing.T) {
-	body, mode, err := Extract([]byte("raw"), "tool_linux_amd64", "tool")
+	_, body, mode, err := Extract([]byte("raw"), "tool_linux_amd64", "tool")
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -117,10 +137,14 @@ func TestExtractRawBinary(t *testing.T) {
 	}
 }
 
-func TestExtractMissing(t *testing.T) {
+func TestExtractMissingReportsIndex(t *testing.T) {
 	blob := tarGz(t, []entry{{"tool_1.0/other", "x"}})
-	if _, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "tool"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
+	_, _, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "tool")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if want := "other"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q should list the archive contents", err)
 	}
 }
 
@@ -129,7 +153,7 @@ func TestExtractRejectsTraversal(t *testing.T) {
 		{"../../etc/passwd", "pwned"},
 		{"tool_1.0/tool", "real"},
 	})
-	body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "")
+	_, body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.gz", "")
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
