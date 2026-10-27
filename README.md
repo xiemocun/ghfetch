@@ -255,12 +255,29 @@ installer is worth. The trade-off is a dependency on `gh` (2.49+) for this one
 flag; without it, `--attestation=optional` warns and reports `failed`, while
 `--attestation=required` stops the install.
 
-Its exit status is not trusted on its own. `gh attestation verify` exits 0 when
-the attestations API answers 404 for a digest, printing the HTTP error to
-stderr, so a wrapper that reads only the exit code reports "verified" for an
-artifact nobody ever attested — which is what v0.4.0 did. `ghfetch` therefore
-parses the `--format json` report and requires an attested subject whose
-`sha256` equals the digest of the bytes it downloaded.
+Its exit status is not trusted on its own. `gh attestation verify` has exited 0
+while the attestations API answered 404 for a digest — printing the HTTP error to
+stderr and verifying nothing — which is what v0.4.0 hit, and later releases exit
+1 for the same request (2.103.3 does). Either way the status is not the signal: a
+wrapper that reads only the exit code reports "verified" for an artifact nobody
+ever attested. `ghfetch` therefore parses the `--format json` report and requires
+an attested subject whose `sha256` equals the digest of the bytes it downloaded.
+
+### TLS trust is part of the binary
+
+The checksum and the attestation are downloaded over TLS, so the CA store matters
+as much as the digest does. Go compiles its own root store and its own denylist,
+which means two binaries on the same host can disagree: after the eMudhra
+intermediate CAs were revoked in October 2026, a system `curl` still completed a
+verified handshake (`Verify return code: 0 (ok)`) through a chain ending in
+`emSign ECC Root CA - G3`, while Go 1.27.3 refused the same chain with
+`x509: no valid chains built` (GO-2026-6809, golang/go#82345).
+
+`go.mod` therefore pins `toolchain go1.27.3`, so `go install
+github.com/xiemocun/ghfetch@latest` downloads that toolchain instead of building
+with whatever older one is on the user's `PATH`; `TestToolchainPinsRevokedCAFix`
+fails if the pin is removed or lowered, and the release workflow reads `go
+version -m` on the built binary and refuses to publish anything older.
 
 ## What it supports
 

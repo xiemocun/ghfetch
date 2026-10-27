@@ -40,6 +40,18 @@ jobs:
               GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
                 go build -trimpath -ldflags "-s -w -X main.version=${version}" \
                 -o "stage/ghfetch${ext}" .
+              # The CA store is compiled in, so the toolchain version is a
+              # security property of the artifact: 1.27.3 is the first release
+              # that refuses the revoked eMudhra chains (GO-2026-6809). Fail the
+              # release rather than ship a verifier that trusts them.
+              if [ "$goos" = linux ] && [ "$goarch" = amd64 ]; then
+                recorded="$(go version -m stage/ghfetch | awk '{print $2}')"
+                if [ "$(printf '%s\n%s\n' "go1.27.3" "$recorded" | sort -V | head -1)" != "go1.27.3" ]; then
+                  echo "::error::built with ${recorded}, need >= go1.27.3 for the revoked-CA denylist (GO-2026-6809)"
+                  exit 1
+                fi
+                echo "toolchain recorded in the binary: ${recorded}"
+              fi
               if [ "$goos" = "windows" ]; then
                 (cd stage && zip -q "../dist/ghfetch_${version}_${goos}_${goarch}.zip" "ghfetch${ext}")
               else
