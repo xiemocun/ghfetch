@@ -39,7 +39,13 @@ func fakeGH(t *testing.T, stdout, stderr string, exit int) {
 }
 
 func attestationJSON(digest string) string {
-	return `[{"attestation":{"bundle":{}},"verificationResult":{"statement":{"subject":[{"name":"release.tar.gz","digest":{"sha256":"` + digest + `"}}]}}}]`
+	return attestationJSONFor("https://github.com/owner/repo", digest)
+}
+
+func attestationJSONFor(sourceRepo, digest string) string {
+	return `[{"attestation":{"bundle":{}},"verificationResult":{` +
+		`"signature":{"certificate":{"sourceRepositoryURI":"` + sourceRepo + `"}},` +
+		`"statement":{"subject":[{"name":"release.tar.gz","digest":{"sha256":"` + digest + `"}}]}}}]`
 }
 
 func TestVerifyAttestationVerified(t *testing.T) {
@@ -136,16 +142,35 @@ func TestAttestationCovers(t *testing.T) {
 		want   bool
 	}{
 		{"match", attestationJSON(testDigest), testDigest, true},
-		{"case insensitive", attestationJSON(strings.ToUpper(testDigest)), testDigest, true},
+		{"case insensitive digest", attestationJSON(strings.ToUpper(testDigest)), testDigest, true},
 		{"other digest", attestationJSON(strings.Repeat("a", 64)), testDigest, false},
+		{"other repository", attestationJSONFor("https://github.com/attacker/ghfetch", testDigest), testDigest, false},
+		{"repo uri without scheme", attestationJSONFor("github.com/Owner/Repo", testDigest), testDigest, true},
 		{"empty", "[]", testDigest, false},
 		{"blank", "  ", testDigest, false},
 		{"garbage", "<html>", testDigest, false},
-		{"no subjects", `[{"verificationResult":{"statement":{"subject":[]}}}]`, testDigest, false},
+		{"no certificate", `[{"verificationResult":{"statement":{"subject":[{"digest":{"sha256":"` + testDigest + `"}}]}}}]`, testDigest, false},
+		{"no subjects", `[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryURI":"https://github.com/owner/repo"}},"statement":{"subject":[]}}}]`, testDigest, false},
 	}
 	for _, c := range cases {
-		if got := attestationCovers([]byte(c.report), c.digest); got != c.want {
+		if got := attestationCovers([]byte(c.report), c.digest, "owner/repo"); got != c.want {
 			t.Errorf("%s: attestationCovers = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestNormalizeRepoURI(t *testing.T) {
+	cases := map[string]string{
+		"https://github.com/Owner/Repo":     "owner/repo",
+		"https://github.com/owner/repo.git": "owner/repo",
+		"http://github.com/owner/repo/":     "owner/repo",
+		"github.com/owner/repo":             "owner/repo",
+		"  https://github.com/owner/repo  ": "owner/repo",
+		"":                                  "",
+	}
+	for in, want := range cases {
+		if got := normalizeRepoURI(in); got != want {
+			t.Errorf("normalizeRepoURI(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

@@ -29,7 +29,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.4.1"
+var version = "0.5.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -351,8 +351,8 @@ func verifyAttestation(ctx context.Context, repo string, data []byte, digest str
 		if problem == "no output" {
 			problem = runErr.Error()
 		}
-	case !attestationCovers(out, digest):
-		problem = "no attestation covers this digest"
+	case !attestationCovers(out, digest, repo):
+		problem = "no attestation covers this digest for " + repo
 	}
 	if problem != "" {
 		if require {
@@ -367,13 +367,25 @@ func verifyAttestation(ctx context.Context, repo string, data []byte, digest str
 }
 
 // attestationCovers reports whether the verifier's JSON report contains at least
-// one verified attestation whose subject list includes digest.
-func attestationCovers(report []byte, digest string) bool {
+// one verified attestation whose subject list includes digest AND whose signing
+// certificate names repo as the source repository.
+//
+// The repository check is deliberate redundancy. `gh attestation verify --repo`
+// already compares the certificate identity with the requested repository, but
+// that behaviour lives in gh, not in this tool; asserting it here means a gh
+// change, a wrapper bug, or a differently scoped verification cannot turn into a
+// passed check for an artifact from someone else's build.
+func attestationCovers(report []byte, digest, repo string) bool {
 	if strings.TrimSpace(string(report)) == "" {
 		return false
 	}
 	var entries []struct {
 		VerificationResult struct {
+			Signature struct {
+				Certificate struct {
+					SourceRepositoryURI string `json:"sourceRepositoryURI"`
+				} `json:"certificate"`
+			} `json:"signature"`
 			Statement struct {
 				Subject []struct {
 					Digest map[string]string `json:"digest"`
@@ -384,7 +396,11 @@ func attestationCovers(report []byte, digest string) bool {
 	if err := json.Unmarshal(report, &entries); err != nil || len(entries) == 0 {
 		return false
 	}
+	want := normalizeRepoURI(repo)
 	for _, e := range entries {
+		if normalizeRepoURI(e.VerificationResult.Signature.Certificate.SourceRepositoryURI) != want {
+			continue
+		}
 		for _, s := range e.VerificationResult.Statement.Subject {
 			if strings.EqualFold(s.Digest["sha256"], digest) {
 				return true
@@ -392,6 +408,18 @@ func attestationCovers(report []byte, digest string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeRepoURI reduces "https://github.com/Owner/Repo.git/" to
+// "owner/repo" so certificate URIs and a --repo argument compare cleanly.
+func normalizeRepoURI(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	for _, prefix := range []string{"https://github.com/", "http://github.com/", "github.com/"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	return s
 }
 
 // firstLine keeps an error report short when a verifier prints a paragraph.
