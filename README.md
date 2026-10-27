@@ -72,6 +72,7 @@ ghfetch version
 | `--source <list>` | comma-separated mirror prefixes, `direct` to skip mirrors |
 | `--require-checksum` | fail when the release publishes no checksum file |
 | `--dry-run` | resolve and print the plan, install nothing |
+| `--json` | print a machine-readable report on stdout |
 
 ### Examples
 
@@ -103,13 +104,44 @@ See the plan without touching disk:
 $ ghfetch install cli/cli --dry-run
 ```
 
+Machine-readable output for scripts and CI:
+
+```console
+$ ghfetch install jqlang/jq --json
+{
+  "repo": "jqlang/jq",
+  "tag": "jq-1.8.2",
+  "asset": "jq-linux-amd64",
+  "size": 2267912,
+  "binary": "jq",
+  "dest": "/tmp/j1",
+  "installed": "/tmp/j1/jq",
+  "source": "ghfast.top",
+  "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
+  "verified": "sha256"
+}
+```
+
 ## What it supports
 
 - Archives: `.tar.gz`, `.tgz`, `.zip`, plain `.gz`, and bare binaries.
 - Checksum manifests: `sha256sum` output, `sha256sum --binary` output, and BSD
   `SHA256 (file) = digest`.
+- Per-asset sidecar digests: `<asset>.sha256`, `.sha256sum`, `.sha256.txt`,
+  `.digest` — for projects that never publish a combined manifest.
 - Set `GH_TOKEN` or `GITHUB_TOKEN` to raise the API rate limit (60 → 5000
   requests/hour).
+
+## Naming
+
+The installed binary is named after the repository (`cli/cli` → `gh` because
+the archive member matches by prefix; `BurntSushi/ripgrep` → `rg` because the
+member carries no platform tokens). When a repo uses a platform-stamped member
+name, `--bin` names it explicitly:
+
+```console
+$ ghfetch install cli/cli --bin gh
+```
 
 ## Deliberate limits
 

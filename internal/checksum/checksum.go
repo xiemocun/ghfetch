@@ -45,3 +45,18 @@ func Lookup(table map[string]string, filename string) (string, bool) {
 	digest, ok := table[strings.ToLower(path.Base(filename))]
 	return digest, ok
 }
+
+// ParseSingle reads a sidecar digest file: a bare sha256, or the usual
+// "hash  file" line that some projects put in <asset>.sha256.
+func ParseSingle(data []byte) (string, bool) {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if digest := sha256Hex.FindString(line); digest != "" {
+			return strings.ToLower(digest), true
+		}
+	}
+	return "", false
+}

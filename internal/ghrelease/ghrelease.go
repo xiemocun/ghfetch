@@ -66,6 +66,29 @@ func (r *Release) ChecksumAsset() (Asset, bool) {
 	return Asset{}, false
 }
 
+// sidecarSuffixes are per-asset digest files, which projects publish when they
+// do not ship a whole manifest.
+var sidecarSuffixes = []string{".sha256", ".sha256sum", ".sha256.txt", ".digest"}
+
+// DigestFor returns the sidecar asset that carries the digest of name, if one
+// exists. Candidates are the full name first, then the name without extension.
+func (r *Release) DigestFor(name string) (Asset, bool) {
+	stems := []string{strings.ToLower(name)}
+	if i := strings.LastIndex(stems[0], "."); i > 0 {
+		stems = append(stems, stems[0][:i])
+	}
+	for _, stem := range stems {
+		for _, suffix := range sidecarSuffixes {
+			for _, a := range r.Assets {
+				if strings.ToLower(a.Name) == stem+suffix {
+					return a, true
+				}
+			}
+		}
+	}
+	return Asset{}, false
+}
+
 // Client talks to the Releases API.
 type Client struct {
 	BaseURL string

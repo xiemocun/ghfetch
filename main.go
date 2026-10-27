@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,7 +28,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -89,6 +90,7 @@ func cmdInstall(args []string) error {
 	sourceList := fs.String("source", "", "comma separated mirror prefixes")
 	needSum := fs.Bool("require-checksum", false, "fail when no checksum file is published")
 	dryRun := fs.Bool("dry-run", false, "resolve only, install nothing")
+	asJSON := fs.Bool("json", false, "emit a machine readable report on stdout")
 	positional, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -137,9 +139,20 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "%s %s -> %s (%s)\n", repo, rel.Tag, asset.Name, humanSize(asset.Size))
+	if !*asJSON {
+		fmt.Fprintf(os.Stderr, "%s %s -> %s (%s)\n", repo, rel.Tag, asset.Name, humanSize(asset.Size))
+	}
+	report := installReport{
+		Repo: repo, Tag: rel.Tag, Asset: asset.Name, Size: asset.Size,
+		Binary: want, Dest: installDir,
+	}
 	if *dryRun {
-		for _, candidate := range chain.Candidates(asset.URL) {
+		report.DryRun = true
+		report.Candidates = chain.Candidates(asset.URL)
+		if *asJSON {
+			return printJSON(report)
+		}
+		for _, candidate := range report.Candidates {
 			fmt.Fprintf(os.Stderr, "  try:     %s\n", candidate)
 		}
 		fmt.Fprintf(os.Stderr, "  binary:  %s\n  install: %s\n", want, filepath.Join(installDir, want))
@@ -150,11 +163,18 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "downloaded %s from %s\n", humanSize(int64(len(data))), hostOf(servedBy))
+	sum := sha256.Sum256(data)
+	report.Source = hostOf(servedBy)
+	report.SHA256 = hex.EncodeToString(sum[:])
+	if !*asJSON {
+		fmt.Fprintf(os.Stderr, "downloaded %s from %s\n", humanSize(int64(len(data))), report.Source)
+	}
 
-	if err := verify(ctx, chain, rel, asset, data, *needSum); err != nil {
+	method, err := verify(ctx, chain, rel, asset, sum, *needSum)
+	if err != nil {
 		return err
 	}
+	report.Verified = method
 
 	picked, body, mode, err := archive.Extract(data, asset.Name, want)
 	if err != nil && errors.Is(err, archive.ErrNotFound) {
@@ -162,6 +182,13 @@ func cmdInstall(args []string) error {
 		// back to the largest executable rather than failing the install.
 		fmt.Fprintf(os.Stderr, "note: %q is not in %s, using the largest executable instead\n", want, asset.Name)
 		picked, body, mode, err = archive.Extract(data, asset.Name, "")
+		if err == nil && picked != "" && platform.Score(picked, target) == 0 {
+			// The member is a clean binary name ("rg"), not a platform-stamped
+			// artifact ("tool_linux_amd64"), so keep it: installing ripgrep as
+			// "rg" is what the user meant.
+			want = picked
+			report.Binary = want
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("%s: %w (use --bin to name the executable)", asset.Name, err)
@@ -173,6 +200,10 @@ func cmdInstall(args []string) error {
 	installed, err := installBinary(installDir, want, body, mode)
 	if err != nil {
 		return err
+	}
+	report.Installed = installed
+	if *asJSON {
+		return printJSON(report)
 	}
 	fmt.Fprintf(os.Stderr, "installed %s (%s)\n", installed, humanSize(int64(len(body))))
 	if !onPath(installDir) {
@@ -209,36 +240,50 @@ func chooseAsset(rel *ghrelease.Release, target platform.Target, exact, pattern 
 	return name, nil
 }
 
-// verify compares the download against the published digest. It fails closed on
-// a mismatch and, with requireSum, on a missing manifest.
-func verify(ctx context.Context, chain *source.Chain, rel *ghrelease.Release, asset ghrelease.Asset, data []byte, requireSum bool) error {
-	sumAsset, hasSum := rel.ChecksumAsset()
-	if !hasSum {
-		if requireSum {
-			return fmt.Errorf("release %s publishes no checksum file", rel.Tag)
+// verify compares the downloaded bytes against the digest the release
+// publishes: a full manifest first, then a per-asset sidecar. It returns the
+// name of the mechanism used, or "" when the release published no digest at
+// all. A mismatch always fails; a missing digest fails only with requireSum.
+func verify(ctx context.Context, chain *source.Chain, rel *ghrelease.Release, asset ghrelease.Asset, sum [32]byte, requireSum bool) (string, error) {
+	actualHex := hex.EncodeToString(sum[:])
+
+	var (
+		wantDigest string
+		source     string
+		found      bool
+	)
+	if sumAsset, ok := rel.ChecksumAsset(); ok {
+		manifest, _, err := chain.Get(ctx, sumAsset.URL)
+		if err != nil {
+			return "", fmt.Errorf("fetch %s: %w", sumAsset.Name, err)
 		}
-		fmt.Fprintln(os.Stderr, "warning: no checksum file in release, installing unverified bytes")
-		return nil
+		wantDigest, found = checksum.Lookup(checksum.Parse(manifest), asset.Name)
+		source = sumAsset.Name
 	}
-	manifest, _, err := chain.Get(ctx, sumAsset.URL)
-	if err != nil {
-		return fmt.Errorf("fetch %s: %w", sumAsset.Name, err)
-	}
-	wantDigest, ok := checksum.Lookup(checksum.Parse(manifest), asset.Name)
-	if !ok {
-		if requireSum {
-			return fmt.Errorf("%s lists no digest for %s", sumAsset.Name, asset.Name)
+	if !found {
+		if side, ok := rel.DigestFor(asset.Name); ok {
+			blob, _, err := chain.Get(ctx, side.URL)
+			if err != nil {
+				return "", fmt.Errorf("fetch %s: %w", side.Name, err)
+			}
+			wantDigest, found = checksum.ParseSingle(blob)
+			source = side.Name
 		}
-		fmt.Fprintf(os.Stderr, "warning: %s has no entry for %s, skipping verification\n", sumAsset.Name, asset.Name)
-		return nil
 	}
-	actual := sha256.Sum256(data)
-	actualHex := hex.EncodeToString(actual[:])
-	if actualHex != wantDigest {
-		return fmt.Errorf("checksum mismatch for %s: published %s, downloaded %s", asset.Name, wantDigest, actualHex)
+
+	switch {
+	case !found:
+		if requireSum {
+			return "", fmt.Errorf("release %s publishes no digest for %s", rel.Tag, asset.Name)
+		}
+		fmt.Fprintln(os.Stderr, "warning: no usable digest in the release, installing unverified bytes")
+		return "", nil
+	case wantDigest != actualHex:
+		return "", fmt.Errorf("checksum mismatch for %s: %s says %s, downloaded %s",
+			asset.Name, source, wantDigest, actualHex)
 	}
-	fmt.Fprintln(os.Stderr, "checksum verified (sha256)")
-	return nil
+	fmt.Fprintf(os.Stderr, "checksum verified (sha256, from %s)\n", source)
+	return "sha256", nil
 }
 
 // installBinary writes body next to its final path and renames it into place, so
@@ -277,9 +322,53 @@ func installBinary(dir, name string, body []byte, mode os.FileMode) (string, err
 	return final, nil
 }
 
+// installReport, listReport and friends are the machine readable output of
+// --json. Field names are snake_case because shell and CI consumers read them.
+type installReport struct {
+	Repo       string   `json:"repo"`
+	Tag        string   `json:"tag"`
+	Asset      string   `json:"asset"`
+	Size       int64    `json:"size"`
+	Binary     string   `json:"binary"`
+	Dest       string   `json:"dest"`
+	Installed  string   `json:"installed,omitempty"`
+	Source     string   `json:"source,omitempty"`
+	SHA256     string   `json:"sha256,omitempty"`
+	Verified   string   `json:"verified,omitempty"`
+	Candidates []string `json:"candidates,omitempty"`
+	DryRun     bool     `json:"dry_run,omitempty"`
+}
+
+type hostReport struct {
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
+}
+
+type listAsset struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	URL      string `json:"url"`
+	Selected bool   `json:"selected"`
+}
+
+type listReport struct {
+	Repo     string      `json:"repo"`
+	Tag      string      `json:"tag"`
+	Host     hostReport  `json:"host"`
+	Selected string      `json:"selected"`
+	Assets   []listAsset `json:"assets"`
+}
+
+func printJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
 func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	asJSON := fs.Bool("json", false, "emit JSON on stdout")
 	positional, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
@@ -300,6 +389,20 @@ func cmdList(args []string) error {
 	}
 	target := platform.Detect()
 	auto, _ := platform.Best(rel.Names(), target)
+
+	if *asJSON {
+		report := listReport{
+			Repo: repo, Tag: rel.Tag,
+			Host:     hostReport{OS: target.OS, Arch: target.Arch},
+			Selected: auto,
+		}
+		for _, a := range rel.Assets {
+			report.Assets = append(report.Assets, listAsset{
+				Name: a.Name, Size: a.Size, URL: a.URL, Selected: a.Name == auto,
+			})
+		}
+		return printJSON(report)
+	}
 
 	fmt.Printf("%s %s (host: %s)\n", repo, rel.Tag, target)
 	for _, a := range rel.Assets {
