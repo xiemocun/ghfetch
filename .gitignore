@@ -1,0 +1,11 @@
+# build output
+/dist/
+/ghfetch
+/ghfetch.exe
+*.test
+*.out
+
+# editor and OS noise
+.DS_Store
+.idea/
+.vscode/

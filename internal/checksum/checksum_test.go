@@ -1,0 +1,40 @@
+package checksum
+
+import "testing"
+
+const digest = "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d"
+
+func TestParseLayouts(t *testing.T) {
+	manifest := []byte(
+		digest + "  tool_1.0_linux_amd64.tar.gz\n" +
+			digest + " *tool_1.0_darwin_arm64.tar.gz\n" +
+			"SHA256 (tool_1.0_windows_amd64.zip) = " + digest + "\n" +
+			"# a comment line\n" +
+			"\n" +
+			"not-a-digest  something.bin\n",
+	)
+	table := Parse(manifest)
+	want := map[string]bool{
+		"tool_1.0_linux_amd64.tar.gz":  true,
+		"tool_1.0_darwin_arm64.tar.gz": true,
+		"tool_1.0_windows_amd64.zip":   true,
+	}
+	if len(table) != len(want) {
+		t.Fatalf("parsed %d entries, want %d: %v", len(table), len(want), table)
+	}
+	for name := range want {
+		if table[name] != digest {
+			t.Errorf("%s = %q", name, table[name])
+		}
+	}
+}
+
+func TestLookupIgnoresCaseAndPath(t *testing.T) {
+	table := Parse([]byte(digest + "  TOOL_1.0_Linux_AMD64.tar.gz\n"))
+	if got, ok := Lookup(table, "Tool_1.0_Linux_AMD64.tar.gz"); !ok || got != digest {
+		t.Errorf("Lookup = %q, %v", got, ok)
+	}
+	if _, ok := Lookup(table, "missing.tar.gz"); ok {
+		t.Error("unexpected hit for a missing file")
+	}
+}
