@@ -41,6 +41,9 @@ by hand, forget to check the checksum. `ghfetch` is that loop, made boring:
 No runtime dependencies. Single static binary. Linux, macOS, Windows; amd64 and
 arm64.
 
+Why the source selector judges throughput instead of reachability — with the
+measurements that produced the rule: [docs/why-speed-not-connectivity.md](docs/why-speed-not-connectivity.md).
+
 ## Install
 
 From a release (yes, using itself):
