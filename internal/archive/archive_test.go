@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -124,6 +125,58 @@ func TestExtractZip(t *testing.T) {
 	}
 	if name != "tool.exe" || string(body) != "windows-binary" {
 		t.Errorf("got %q (%q)", name, body)
+	}
+}
+
+func TestExtractTarBz2(t *testing.T) {
+	blob, err := os.ReadFile("testdata/tool.tar.bz2")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	name, body, mode, err := Extract(blob, "tool_1.0_linux_amd64.tar.bz2", "tool")
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if name != "tool" || string(body) != "#!/bin/sh\necho from-bzip2-or-xz\n" {
+		t.Errorf("got %q (%q)", name, body)
+	}
+	if mode&0o111 == 0 {
+		t.Errorf("mode %v is not executable", mode)
+	}
+}
+
+func TestExtractTarXz(t *testing.T) {
+	blob, err := os.ReadFile("testdata/tool.tar.xz")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	name, body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.xz", "tool")
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if name != "tool" || string(body) != "#!/bin/sh\necho from-bzip2-or-xz\n" {
+		t.Errorf("got %q (%q)", name, body)
+	}
+}
+
+func TestExtractTarXzAutoSelect(t *testing.T) {
+	blob, err := os.ReadFile("testdata/tool.tar.xz")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	// No --bin: the README must not win over the executable.
+	_, body, _, err := Extract(blob, "tool_1.0_linux_amd64.tar.xz", "")
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if strings.Contains(string(body), "# docs") {
+		t.Errorf("picked the README: %q", body)
+	}
+}
+
+func TestExtractTarXzRejectsGarbage(t *testing.T) {
+	if _, _, _, err := Extract([]byte("not an xz stream"), "tool.tar.xz", "tool"); err == nil {
+		t.Fatal("expected an error for a corrupt xz stream")
 	}
 }
 

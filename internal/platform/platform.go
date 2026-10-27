@@ -127,7 +127,10 @@ func Score(name string, t Target) int {
 	}
 
 	switch {
-	case strings.HasSuffix(low, ".tar.gz"), strings.HasSuffix(low, ".tgz"), strings.HasSuffix(low, ".zip"):
+	case strings.HasSuffix(low, ".tar.gz"), strings.HasSuffix(low, ".tgz"),
+		strings.HasSuffix(low, ".tar.xz"), strings.HasSuffix(low, ".txz"),
+		strings.HasSuffix(low, ".tar.bz2"), strings.HasSuffix(low, ".tbz2"),
+		strings.HasSuffix(low, ".zip"):
 		score += 10
 	case strings.HasSuffix(low, ".deb"), strings.HasSuffix(low, ".rpm"),
 		strings.HasSuffix(low, ".msi"), strings.HasSuffix(low, ".apk"),

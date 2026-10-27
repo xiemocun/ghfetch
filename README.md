@@ -124,7 +124,8 @@ $ ghfetch install jqlang/jq --json
 
 ## What it supports
 
-- Archives: `.tar.gz`, `.tgz`, `.zip`, plain `.gz`, and bare binaries.
+- Archives: `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.zip`,
+  plain `.gz`, and bare binaries.
 - Checksum manifests: `sha256sum` output, `sha256sum --binary` output, and BSD
   `SHA256 (file) = digest`.
 - Per-asset sidecar digests: `<asset>.sha256`, `.sha256sum`, `.sha256.txt`,

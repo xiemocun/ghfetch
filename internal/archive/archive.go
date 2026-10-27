@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"github.com/ulikunitz/xz"
 )
 
 // MaxBinarySize caps a single extracted file, so a hostile archive cannot
@@ -36,6 +39,14 @@ func Extract(data []byte, filename, want string) (name string, body []byte, mode
 		}
 		defer gz.Close()
 		return fromTar(tar.NewReader(gz), want)
+	case strings.HasSuffix(low, ".tar.bz2"), strings.HasSuffix(low, ".tbz2"):
+		return fromTar(tar.NewReader(bzip2.NewReader(bytes.NewReader(data))), want)
+	case strings.HasSuffix(low, ".tar.xz"), strings.HasSuffix(low, ".txz"):
+		xr, err := xz.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return "", nil, 0, fmt.Errorf("open xz stream: %w", err)
+		}
+		return fromTar(tar.NewReader(xr), want)
 	case strings.HasSuffix(low, ".zip"):
 		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
