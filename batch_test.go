@@ -444,9 +444,15 @@ func TestInstallAllContinuesAfterAFailure(t *testing.T) {
 	if batch.Results[1].Attestation == "" || batch.Results[1].AttestationMode == "" {
 		t.Errorf("failed item = %+v, want an attestation state and mode", batch.Results[1])
 	}
-	for _, name := range []string{"tool", "other"} {
-		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
-			t.Errorf("%s was not installed: %v", name, err)
+	// Every item that reported "installed" must actually be on disk; the path is
+	// taken from the report because the file name is platform dependent
+	// (tool.exe on Windows).
+	for _, result := range batch.Results {
+		if result.Status != statusInstalled {
+			continue
+		}
+		if _, err := os.Stat(result.Installed); err != nil {
+			t.Errorf("%s was not installed at %s: %v", result.Repo, result.Installed, err)
 		}
 	}
 }

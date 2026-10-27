@@ -93,7 +93,9 @@ func TestCorruptFileIsReportedAndRecovered(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("recovered file is not valid JSON: %v\n%s", err, data)
 	}
-	if decoded["/usr/local/bin/gh"].Repo != "cli/cli" {
+	// The key is cleaned on write, which differs by platform, so look it up the
+	// same way the store does.
+	if decoded[filepath.Clean("/usr/local/bin/gh")].Repo != "cli/cli" {
 		t.Errorf("recovered file lost the new record: %s", data)
 	}
 }
