@@ -148,6 +148,13 @@ installer is worth. The trade-off is a dependency on `gh` (2.49+) for this one
 flag; without it, `--verify-attestation` warns and `--require-attestation`
 fails.
 
+Its exit status is not trusted on its own. `gh attestation verify` exits 0 when
+the attestations API answers 404 for a digest, printing the HTTP error to
+stderr, so a wrapper that reads only the exit code reports "verified" for an
+artifact nobody ever attested — which is what v0.4.0 did. `ghfetch` therefore
+parses the `--format json` report and requires an attested subject whose
+`sha256` equals the digest of the bytes it downloaded.
+
 ## What it supports
 
 - Archives: `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.zip`,

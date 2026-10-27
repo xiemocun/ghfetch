@@ -29,7 +29,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.4.0"
+var version = "0.4.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -183,7 +183,7 @@ func cmdInstall(args []string) error {
 	report.Verified = method
 
 	if *verifyAtt || *requireAtt {
-		attestation, err := verifyAttestation(ctx, repo, data, *requireAtt)
+		attestation, err := verifyAttestation(ctx, repo, data, report.SHA256, *requireAtt)
 		if err != nil {
 			return err
 		}
@@ -307,7 +307,13 @@ func verify(ctx context.Context, chain *source.Chain, rel *ghrelease.Release, as
 // bundle format, and it is the verifier GitHub documents. Reimplementing it
 // here would mean shipping a TUF root store inside an installer, which is a
 // much larger trust surface than the installer itself.
-func verifyAttestation(ctx context.Context, repo string, data []byte, require bool) (string, error) {
+//
+// Its exit status is NOT trusted on its own. `gh attestation verify` exits 0
+// when the attestations API answers 404 for the digest, printing the HTTP error
+// to stderr, so a wrapper that only reads the exit code reports "verified" for
+// an artifact nobody ever attested. The JSON report is parsed instead, and the
+// attested subject digest must equal the digest of the bytes we downloaded.
+func verifyAttestation(ctx context.Context, repo string, data []byte, digest string, require bool) (string, error) {
 	ghBin, err := exec.LookPath("gh")
 	if err != nil {
 		if require {
@@ -333,17 +339,59 @@ func verifyAttestation(ctx context.Context, repo string, data []byte, require bo
 		return "", fmt.Errorf("close temp file for attestation check: %w", cerr)
 	}
 
-	out, err := exec.CommandContext(ctx, ghBin, "attestation", "verify", tmpName, "--repo", repo).CombinedOutput()
-	if err != nil {
-		detail := firstLine(string(out))
-		if require {
-			return "", fmt.Errorf("build provenance did not verify for %s: %s", repo, detail)
+	cmd := exec.CommandContext(ctx, ghBin, "attestation", "verify", tmpName, "--repo", repo, "--format", "json")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, runErr := cmd.Output()
+
+	problem := ""
+	switch {
+	case runErr != nil:
+		problem = firstLine(stderr.String())
+		if problem == "no output" {
+			problem = runErr.Error()
 		}
-		fmt.Fprintf(os.Stderr, "warning: build provenance did not verify (%s)\n", detail)
+	case !attestationCovers(out, digest):
+		problem = "no attestation covers this digest"
+	}
+	if problem != "" {
+		if require {
+			return "", fmt.Errorf("build provenance did not verify for %s: %s", repo, problem)
+		}
+		fmt.Fprintf(os.Stderr, "warning: build provenance did not verify for %s (%s)\n", repo, problem)
 		return "", nil
 	}
+
 	fmt.Fprintf(os.Stderr, "build provenance verified (gh attestation, %s)\n", repo)
 	return "verified", nil
+}
+
+// attestationCovers reports whether the verifier's JSON report contains at least
+// one verified attestation whose subject list includes digest.
+func attestationCovers(report []byte, digest string) bool {
+	if strings.TrimSpace(string(report)) == "" {
+		return false
+	}
+	var entries []struct {
+		VerificationResult struct {
+			Statement struct {
+				Subject []struct {
+					Digest map[string]string `json:"digest"`
+				} `json:"subject"`
+			} `json:"statement"`
+		} `json:"verificationResult"`
+	}
+	if err := json.Unmarshal(report, &entries); err != nil || len(entries) == 0 {
+		return false
+	}
+	for _, e := range entries {
+		for _, s := range e.VerificationResult.Statement.Subject {
+			if strings.EqualFold(s.Digest["sha256"], digest) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // firstLine keeps an error report short when a verifier prints a paragraph.

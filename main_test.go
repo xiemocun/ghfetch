@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,23 +10,41 @@ import (
 	"testing"
 )
 
-// fakeGH puts a stub `gh` first on PATH so the provenance path can be tested
-// without the real CLI, a network, or a repository that attests.
-func fakeGH(t *testing.T, body string) {
+const testDigest = "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
+
+// fakeGH puts a stub `gh` first on PATH that prints the given streams and exits
+// with the given status, so the provenance path is tested without the real CLI,
+// a network, or a repository that attests.
+func fakeGH(t *testing.T, stdout, stderr string, exit int) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the stub gh is a POSIX shell script")
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+	outPath := filepath.Join(dir, "stdout.json")
+	errPath := filepath.Join(dir, "stderr.txt")
+	if err := os.WriteFile(outPath, []byte(stdout), 0o644); err != nil {
+		t.Fatalf("write stdout fixture: %v", err)
+	}
+	if err := os.WriteFile(errPath, []byte(stderr), 0o644); err != nil {
+		t.Fatalf("write stderr fixture: %v", err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\ncat %q 2>/dev/null\ncat %q >&2 2>/dev/null\nexit %d\n", outPath, errPath, exit)
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write stub gh: %v", err)
 	}
-	t.Setenv("PATH", dir)
+	// Keep the rest of PATH: the stub needs cat, and being first means LookPath
+	// still resolves `gh` to the stub.
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func attestationJSON(digest string) string {
+	return `[{"attestation":{"bundle":{}},"verificationResult":{"statement":{"subject":[{"name":"release.tar.gz","digest":{"sha256":"` + digest + `"}}]}}}]`
 }
 
 func TestVerifyAttestationVerified(t *testing.T) {
-	fakeGH(t, "echo 'verification succeeded'\nexit 0\n")
-	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), true)
+	fakeGH(t, attestationJSON(testDigest), "", 0)
+	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,9 +53,41 @@ func TestVerifyAttestationVerified(t *testing.T) {
 	}
 }
 
+// TestVerifyAttestationIgnoresZeroExitOn404 pins the real defect this wrapper
+// was written against: `gh attestation verify` exits 0 when the attestations API
+// answers 404, so the exit status alone must never be read as success.
+func TestVerifyAttestationIgnoresZeroExitOn404(t *testing.T) {
+	fakeGH(t, "", "Error: HTTP 404: Not Found (https://api.github.com/repos/owner/repo/attestations/sha256:...)", 0)
+	_, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
+	if err == nil {
+		t.Fatal("a zero exit with no attestation report must not count as verified")
+	}
+}
+
+func TestVerifyAttestationRejectsEmptyReport(t *testing.T) {
+	fakeGH(t, "[]", "", 0)
+	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+		t.Fatal("an empty attestation list must not verify")
+	}
+}
+
+func TestVerifyAttestationRejectsDigestMismatch(t *testing.T) {
+	fakeGH(t, attestationJSON(strings.Repeat("0", 64)), "", 0)
+	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+		t.Fatal("an attestation for another digest must not verify this artifact")
+	}
+}
+
+func TestVerifyAttestationRejectsNonJSON(t *testing.T) {
+	fakeGH(t, "verification succeeded\n", "", 0)
+	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
+		t.Fatal("unparseable verifier output must not verify")
+	}
+}
+
 func TestVerifyAttestationFailureIsFatalWhenRequired(t *testing.T) {
-	fakeGH(t, "echo 'no attestations found for subject'\nexit 1\n")
-	_, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), true)
+	fakeGH(t, "", "no attestations found for subject\n", 1)
+	_, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -49,8 +100,8 @@ func TestVerifyAttestationFailureIsFatalWhenRequired(t *testing.T) {
 }
 
 func TestVerifyAttestationFailureIsWarningWhenOptional(t *testing.T) {
-	fakeGH(t, "echo 'no attestations found for subject'\nexit 1\n")
-	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), false)
+	fakeGH(t, "", "no attestations found for subject\n", 1)
+	got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, false)
 	if err != nil {
 		t.Fatalf("optional verification must not fail the install: %v", err)
 	}
@@ -63,16 +114,39 @@ func TestVerifyAttestationWithoutGH(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PATH handling differs on Windows")
 	}
-	t.Setenv("PATH", t.TempDir()) // a directory with no gh in it
+	// A directory with no gh in it, and no fallback entry that holds one either.
+	t.Setenv("PATH", t.TempDir()+string(os.PathListSeparator)+"/nonexistent")
 
-	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), true); err == nil {
+	if _, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, true); err == nil {
 		t.Fatal("required provenance must fail when gh is missing")
 	} else if !strings.Contains(err.Error(), "gh CLI not found") {
 		t.Errorf("error should say gh is missing, got: %v", err)
 	}
 
-	if got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), false); err != nil || got != "" {
+	if got, err := verifyAttestation(context.Background(), "owner/repo", []byte("asset"), testDigest, false); err != nil || got != "" {
 		t.Errorf("optional provenance with no gh = %q, %v; want \"\", nil", got, err)
+	}
+}
+
+func TestAttestationCovers(t *testing.T) {
+	cases := []struct {
+		name   string
+		report string
+		digest string
+		want   bool
+	}{
+		{"match", attestationJSON(testDigest), testDigest, true},
+		{"case insensitive", attestationJSON(strings.ToUpper(testDigest)), testDigest, true},
+		{"other digest", attestationJSON(strings.Repeat("a", 64)), testDigest, false},
+		{"empty", "[]", testDigest, false},
+		{"blank", "  ", testDigest, false},
+		{"garbage", "<html>", testDigest, false},
+		{"no subjects", `[{"verificationResult":{"statement":{"subject":[]}}}]`, testDigest, false},
+	}
+	for _, c := range cases {
+		if got := attestationCovers([]byte(c.report), c.digest); got != c.want {
+			t.Errorf("%s: attestationCovers = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
