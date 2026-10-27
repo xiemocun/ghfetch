@@ -14,7 +14,7 @@ const (
 	bashCompletion = `# bash completion for ghfetch
 # Install: ghfetch completion bash > /etc/bash_completion.d/ghfetch
 _ghfetch_commands='install list completion version help'
-_ghfetch_install_flags='--to --asset --bin --dest --source --require-checksum --attestation --verify-attestation --require-attestation --dry-run --json'
+_ghfetch_install_flags='--all --force --to --asset --bin --dest --source --require-checksum --attestation --verify-attestation --require-attestation --dry-run --json'
 _ghfetch_list_flags='--json'
 _ghfetch_shells='bash zsh fish'
 _ghfetch_attestation='off optional required'
@@ -101,6 +101,8 @@ _ghfetch() {
           ;;
         install)
           _arguments \
+            '--all[install every repository named on the command line]' \
+            '--force[reinstall even when the recorded install matches]' \
             '--to[use this exact release asset]:file:_files' \
             '--asset[choose the asset by regular expression]:regexp:' \
             '--bin[executable inside the archive]:name:' \
@@ -140,6 +142,8 @@ complete -c ghfetch -n '__fish_use_subcommand' -a help -d 'print usage'
 
 complete -c ghfetch -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
 
+complete -c ghfetch -n '__fish_seen_subcommand_from install' -l all -d 'install every repository named on the command line'
+complete -c ghfetch -n '__fish_seen_subcommand_from install' -l force -d 'reinstall even when the recorded install matches'
 complete -c ghfetch -n '__fish_seen_subcommand_from install' -l to -r -F -d 'exact release asset'
 complete -c ghfetch -n '__fish_seen_subcommand_from install' -l asset -r -d 'asset regular expression'
 complete -c ghfetch -n '__fish_seen_subcommand_from install' -l bin -r -d 'executable inside the archive'

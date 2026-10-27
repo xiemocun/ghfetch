@@ -26,10 +26,11 @@ import (
 	"github.com/xiemocun/ghfetch/internal/ghrelease"
 	"github.com/xiemocun/ghfetch/internal/platform"
 	"github.com/xiemocun/ghfetch/internal/source"
+	"github.com/xiemocun/ghfetch/internal/state"
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.7.0"
+var version = "0.8.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -65,13 +66,15 @@ func usage() {
 	fmt.Fprint(os.Stderr, `ghfetch - install GitHub release binaries without fighting the network
 
 USAGE
-  ghfetch install <owner/repo>[@tag] [flags]
+  ghfetch install [--all] <owner/repo>[@tag]... [flags]
   ghfetch list    <owner/repo>[@tag]
   ghfetch completion <bash|zsh|fish>
   ghfetch version
   ghfetch help
 
 INSTALL FLAGS
+  --all                install every repository named on the command line
+  --force              reinstall even when the recorded install matches
   --to <file>          use this exact release asset
   --asset <regexp>     choose the asset by regular expression
   --bin <name>         executable inside the archive (default: repo name)
@@ -84,30 +87,71 @@ INSTALL FLAGS
   --dry-run            resolve and print the plan, install nothing
   --json               machine readable report on stdout
 
+Installing a tag that is already recorded as installed at the same path is a
+no-op; the record lives in ~/.local/state/ghfetch/installed.json (override with
+GHFETCH_STATE_FILE).
+
 Set GH_TOKEN or GITHUB_TOKEN to raise the API rate limit.
 `)
+}
+
+// releaseFor is the one API call the install path makes, behind a variable so
+// tests can drive the whole install against a local server.
+var releaseFor = func(ctx context.Context, repo, tag string) (*ghrelease.Release, error) {
+	return ghrelease.New().Release(ctx, repo, tag)
+}
+
+// The status strings are part of the --json contract and are asserted by tests.
+const (
+	statusInstalled = "installed"
+	statusSkipped   = "skipped"
+	statusPlanned   = "planned"
+	statusFailed    = "failed"
+)
+
+// installOptions carries the resolved flags so the single and the batch form
+// cannot drift apart.
+type installOptions struct {
+	asset   string
+	bin     string
+	dest    string
+	exact   string
+	source  string
+	needSum bool
+	attMode attestationMode
+	dryRun  bool
+	json    bool
+	force   bool
 }
 
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	pick := fs.String("asset", "", "regexp selecting the release asset")
-	binName := fs.String("bin", "", "executable inside the archive")
-	dest := fs.String("dest", "", "install directory")
-	exact := fs.String("to", "", "exact asset filename")
-	sourceList := fs.String("source", "", "comma separated mirror prefixes")
-	needSum := fs.Bool("require-checksum", false, "fail when no checksum file is published")
+	var opts installOptions
+	fs.StringVar(&opts.asset, "asset", "", "regexp selecting the release asset")
+	fs.StringVar(&opts.bin, "bin", "", "executable inside the archive")
+	fs.StringVar(&opts.dest, "dest", "", "install directory")
+	fs.StringVar(&opts.exact, "to", "", "exact asset filename")
+	fs.StringVar(&opts.source, "source", "", "comma separated mirror prefixes")
+	fs.BoolVar(&opts.needSum, "require-checksum", false, "fail when no checksum file is published")
 	attPolicy := fs.String("attestation", "", "SLSA provenance policy: off, optional or required")
 	verifyAtt := fs.Bool("verify-attestation", false, "alias for --attestation=optional")
 	requireAtt := fs.Bool("require-attestation", false, "alias for --attestation=required")
-	dryRun := fs.Bool("dry-run", false, "resolve only, install nothing")
-	asJSON := fs.Bool("json", false, "emit a machine readable report on stdout")
+	fs.BoolVar(&opts.dryRun, "dry-run", false, "resolve only, install nothing")
+	fs.BoolVar(&opts.json, "json", false, "emit a machine readable report on stdout")
+	all := fs.Bool("all", false, "install every repository named on the command line")
+	fs.BoolVar(&opts.force, "force", false, "reinstall even when the recorded install matches")
 	positional, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(positional) != 1 {
+	if len(positional) == 0 {
 		return errors.New("usage: ghfetch install <owner/repo>[@tag]")
+	}
+	// Several repositories is what --all is for; accepting a list silently
+	// would make "install a b" look like it installed b only.
+	if len(positional) > 1 && !*all {
+		return fmt.Errorf("install takes one repository, got %d (pass --all to install several)", len(positional))
 	}
 	// Resolve the provenance policy before touching the network: a typo in
 	// --attestation should not cost an API round trip.
@@ -115,93 +159,175 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	repo, tag, err := splitSpec(positional[0])
-	if err != nil {
-		return err
-	}
-	target := platform.Detect()
+	opts.attMode = attMode
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	rel, err := ghrelease.New().Release(ctx, repo, tag)
+	if *all {
+		return installAll(ctx, positional, opts)
+	}
+	report, err := installOne(ctx, positional[0], opts)
 	if err != nil {
 		return err
 	}
+	// installOne owns the human-readable progress, so a batch and a single
+	// install print the same lines; JSON is printed once, by the caller.
+	if opts.json {
+		return printJSON(report)
+	}
+	return nil
+}
 
-	assetName, err := chooseAsset(rel, target, *exact, *pick)
+// installAll installs every spec, in order, and keeps going after a failure: one
+// unbuildable repository must not leave the rest of a tool list uninstalled.
+// The error returned at the end names what failed, so the exit code stays
+// meaningful for scripts.
+func installAll(ctx context.Context, specs []string, opts installOptions) error {
+	reports := make([]installReport, 0, len(specs))
+	var failed []string
+	var installed, skipped int
+	for i, spec := range specs {
+		fmt.Fprintf(os.Stderr, "[%d/%d] %s\n", i+1, len(specs), spec)
+		report, err := installOne(ctx, spec, opts)
+		if err != nil {
+			report = installReport{
+				Repo: spec, Status: statusFailed, Error: err.Error(),
+				// Keep the three-state attestation contract even for a failure:
+				// nothing was verified, and the detail says why it is not
+				// "skipped because you did not ask".
+				Attestation: attestationSkipped, AttestationMode: opts.attMode.String(),
+				AttestationDetail: "not attempted: the install failed",
+			}
+			failed = append(failed, spec)
+			fmt.Fprintf(os.Stderr, "error: %s: %v\n", spec, err)
+		}
+		switch report.Status {
+		case statusInstalled:
+			installed++
+		case statusSkipped:
+			skipped++
+		}
+		reports = append(reports, report)
+	}
+	if opts.json {
+		if err := printJSON(batchReport{OK: len(failed) == 0, Results: reports}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "%d installed, %d skipped, %d failed (of %d)\n",
+			installed, skipped, len(failed), len(specs))
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d of %d installs failed: %s", len(failed), len(specs), strings.Join(failed, ", "))
+	}
+	return nil
+}
+
+// installOne resolves and installs a single spec. It prints progress to stderr
+// and returns the report --json prints, so both entry points share one path.
+func installOne(ctx context.Context, spec string, o installOptions) (installReport, error) {
+	repo, tag, err := splitSpec(spec)
 	if err != nil {
-		return err
+		return installReport{}, err
+	}
+	target := platform.Detect()
+
+	rel, err := releaseFor(ctx, repo, tag)
+	if err != nil {
+		return installReport{}, err
+	}
+
+	assetName, err := chooseAsset(rel, target, o.exact, o.asset)
+	if err != nil {
+		return installReport{}, err
 	}
 	asset, ok := rel.Asset(assetName)
 	if !ok {
-		return fmt.Errorf("release %s has no asset named %q", rel.Tag, assetName)
+		return installReport{}, fmt.Errorf("release %s has no asset named %q", rel.Tag, assetName)
 	}
 
-	want := *binName
+	want := o.bin
 	if want == "" {
 		want = path.Base(repo) + target.BinSuffix()
 	} else if target.OS == "windows" && !strings.HasSuffix(want, ".exe") {
 		want += ".exe"
 	}
 
-	prefixes, err := source.ParsePrefixes(*sourceList)
+	prefixes, err := source.ParsePrefixes(o.source)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
 	chain := source.New(prefixes)
-	installDir, err := resolveDest(*dest)
+	installDir, err := resolveDest(o.dest)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
+	final := filepath.Join(installDir, want)
 
-	if !*asJSON {
-		fmt.Fprintf(os.Stderr, "%s %s -> %s (%s)\n", repo, rel.Tag, asset.Name, humanSize(asset.Size))
-	}
 	report := installReport{
 		Repo: repo, Tag: rel.Tag, Asset: asset.Name, Size: asset.Size,
-		Binary: want, Dest: installDir,
+		Binary: want, Dest: installDir, Status: statusPlanned,
 		// --json consumers must never have to read an empty attestation field
 		// and guess whether verification ran: "skipped" is stated up front and
 		// only an actual verification pass overwrites it.
-		Attestation: attestationSkipped, AttestationMode: attMode.String(),
+		Attestation: attestationSkipped, AttestationMode: o.attMode.String(),
 	}
-	if *dryRun {
+
+	// Idempotency comes before the download, not after: the whole point is to
+	// not fetch a binary that is already on disk at this tag.
+	if !o.dryRun && !o.force {
+		rec, skip, why := alreadyInstalled(installDir, repo, rel)
+		if skip {
+			report.Status = statusSkipped
+			report.Installed = rec.Path
+			report.Binary = filepath.Base(rec.Path)
+			fmt.Fprintf(os.Stderr, "%s %s is already installed at %s (--force reinstalls)\n", repo, rel.Tag, rec.Path)
+			return report, nil
+		}
+		if why != "" {
+			fmt.Fprintf(os.Stderr, "note: reinstalling %s: %s\n", want, why)
+		}
+	}
+
+	if !o.json {
+		fmt.Fprintf(os.Stderr, "%s %s -> %s (%s)\n", repo, rel.Tag, asset.Name, humanSize(asset.Size))
+	}
+	if o.dryRun {
 		report.DryRun = true
 		report.Candidates = chain.Candidates(asset.URL)
-		if *asJSON {
-			return printJSON(report)
+		if o.json {
+			return report, nil
 		}
 		for _, candidate := range report.Candidates {
 			fmt.Fprintf(os.Stderr, "  try:     %s\n", candidate)
 		}
-		fmt.Fprintf(os.Stderr, "  binary:  %s\n  install: %s\n", want, filepath.Join(installDir, want))
-		return nil
+		fmt.Fprintf(os.Stderr, "  binary:  %s\n  install: %s\n", want, final)
+		return report, nil
 	}
 
 	data, servedBy, err := chain.Get(ctx, asset.URL)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
 	sum := sha256.Sum256(data)
 	report.Source = hostOf(servedBy)
 	report.SHA256 = hex.EncodeToString(sum[:])
-	if !*asJSON {
+	if !o.json {
 		fmt.Fprintf(os.Stderr, "downloaded %s from %s\n", humanSize(int64(len(data))), report.Source)
 	}
 
-	method, err := verify(ctx, chain, rel, asset, sum, *needSum)
+	method, err := verify(ctx, chain, rel, asset, sum, o.needSum)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
 	report.Verified = method
 
 	// Called even when the policy is off: verifyAttestation returns immediately
 	// with "skipped" so the report always carries one of the three statuses.
-	status, detail, err := verifyAttestation(ctx, repo, data, report.SHA256, attMode)
+	status, detail, err := verifyAttestation(ctx, repo, data, report.SHA256, o.attMode)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
 	report.Attestation = status
 	report.AttestationDetail = detail
@@ -218,10 +344,11 @@ func cmdInstall(args []string) error {
 			// "rg" is what the user meant.
 			want = picked
 			report.Binary = want
+			final = filepath.Join(installDir, want)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("%s: %w (use --bin to name the executable)", asset.Name, err)
+		return installReport{}, fmt.Errorf("%s: %w (use --bin to name the executable)", asset.Name, err)
 	}
 	if picked != "" && picked != want {
 		fmt.Fprintf(os.Stderr, "note: archive member %q installed as %q\n", picked, want)
@@ -229,17 +356,93 @@ func cmdInstall(args []string) error {
 
 	installed, err := installBinary(installDir, want, body, mode)
 	if err != nil {
-		return err
+		return installReport{}, err
 	}
 	report.Installed = installed
-	if *asJSON {
-		return printJSON(report)
+	report.Status = statusInstalled
+	// Recorded after the rename: a record pointing at a file that is not there
+	// would make the next install skip a binary it never wrote.
+	rememberInstall(installed, repo, rel, asset, body)
+	if o.json {
+		return report, nil
 	}
 	fmt.Fprintf(os.Stderr, "installed %s (%s)\n", installed, humanSize(int64(len(body))))
 	if !onPath(installDir) {
 		fmt.Fprintf(os.Stderr, "note: %s is not in PATH\n", installDir)
 	}
-	return nil
+	return report, nil
+}
+
+// alreadyInstalled reports whether this repository is already installed at this
+// release in destDir, so the download can be skipped.
+//
+// The state file is the only source of truth. Asking the installed binary for
+// its version would tie the decision to each project's flag spelling ("-v",
+// "--version", "version", a bare tag), which is exactly the kind of guessing
+// that silently installs the wrong thing. The digest on disk is re-checked as
+// well, so a binary someone replaced by hand is installed again instead of
+// being trusted because a record exists.
+func alreadyInstalled(destDir, repo string, rel *ghrelease.Release) (rec state.Record, skip bool, why string) {
+	store, ok := stateStore()
+	if !ok {
+		return state.Record{}, false, ""
+	}
+	rec, have := store.Get(state.Key(repo, destDir))
+	if !have {
+		return state.Record{}, false, ""
+	}
+	switch {
+	case rec.Tag != rel.Tag:
+		return rec, false, fmt.Sprintf("%s is installed at %s, the release is %s", repo, rec.Tag, rel.Tag)
+	case rec.SHA256 == "":
+		return rec, false, "the recorded digest is missing"
+	case rec.Path == "":
+		return rec, false, "the record does not say where the binary is"
+	case filepath.Dir(filepath.Clean(rec.Path)) != filepath.Clean(destDir):
+		// A record pointing outside the destination says nothing about the file
+		// this install is about to write.
+		return rec, false, fmt.Sprintf("the record points at %s, outside %s", rec.Path, destDir)
+	}
+	data, err := os.ReadFile(rec.Path)
+	if err != nil {
+		return rec, false, fmt.Sprintf("cannot read %s: %v", rec.Path, err)
+	}
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != rec.SHA256 {
+		return rec, false, fmt.Sprintf("%s no longer matches the recorded digest", rec.Path)
+	}
+	return rec, true, ""
+}
+
+// stateStore resolves the install record. A machine where the record cannot be
+// located still installs; it just cannot skip.
+func stateStore() (state.Store, bool) {
+	path, err := state.DefaultPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: install record disabled: %v\n", err)
+		return state.Store{}, false
+	}
+	return state.Store{Path: path}, true
+}
+
+// rememberInstall records what was installed. Failing to write the record is a
+// warning: the binary is already in place and correct, and the only consequence
+// is that the next run downloads it again.
+func rememberInstall(installed, repo string, rel *ghrelease.Release, asset ghrelease.Asset, body []byte) {
+	store, ok := stateStore()
+	if !ok {
+		return
+	}
+	sum := sha256.Sum256(body)
+	rec := state.Record{
+		Repo: repo, Tag: rel.Tag,
+		Path: installed, Binary: filepath.Base(installed), Asset: asset.Name,
+		SHA256:      hex.EncodeToString(sum[:]),
+		InstalledAt: time.Now().UTC(),
+	}
+	if err := store.Put(state.Key(repo, filepath.Dir(installed)), rec); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not record the install in %s: %v\n", store.Path, err)
+	}
 }
 
 // chooseAsset resolves the asset to install: an explicit name, a regexp, then
@@ -595,9 +798,14 @@ type installReport struct {
 	Binary    string `json:"binary"`
 	Dest      string `json:"dest"`
 	Installed string `json:"installed,omitempty"`
-	Source    string `json:"source,omitempty"`
-	SHA256    string `json:"sha256,omitempty"`
-	Verified  string `json:"verified,omitempty"`
+	// Status is always present and is one of installed, skipped, planned or
+	// failed, so a caller never has to infer what happened from the other
+	// fields being empty.
+	Status   string `json:"status"`
+	Error    string `json:"error,omitempty"`
+	Source   string `json:"source,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
+	Verified string `json:"verified,omitempty"`
 	// Attestation is always present and is one of verified, skipped or failed.
 	// An empty value would mean "the caller has to guess".
 	Attestation       string   `json:"attestation"`
@@ -610,6 +818,14 @@ type installReport struct {
 type hostReport struct {
 	OS   string `json:"os"`
 	Arch string `json:"arch"`
+}
+
+// batchReport is what --all --json prints: one entry per requested repository,
+// in the order they were named, so a pipeline can find the failures without
+// parsing stderr.
+type batchReport struct {
+	OK      bool            `json:"ok"`
+	Results []installReport `json:"results"`
 }
 
 type listAsset struct {

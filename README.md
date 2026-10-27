@@ -58,7 +58,7 @@ $ go install github.com/xiemocun/ghfetch@latest
 ## Usage
 
 ```console
-ghfetch install <owner/repo>[@tag] [flags]
+ghfetch install [--all] <owner/repo>[@tag]... [flags]
 ghfetch list    <owner/repo>[@tag]
 ghfetch completion <bash|zsh|fish>
 ghfetch version
@@ -66,6 +66,8 @@ ghfetch version
 
 | Flag | Meaning |
 |---|---|
+| `--all` | install every repository named on the command line |
+| `--force` | reinstall even when the recorded install already matches |
 | `--to <file>` | use this exact release asset |
 | `--asset <regexp>` | select the asset with a regular expression |
 | `--bin <name>` | executable inside the archive (default: `repo` name) |
@@ -120,6 +122,7 @@ $ ghfetch install jqlang/jq --json
   "binary": "jq",
   "dest": "/tmp/j1",
   "installed": "/tmp/j1/jq",
+  "status": "installed",
   "source": "ghfast.top",
   "sha256": "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f",
   "verified": "sha256",
@@ -131,6 +134,69 @@ $ ghfetch install jqlang/jq --json
 `attestation` is always present, always one of `verified`, `skipped` or
 `failed`, and `attestation_detail` explains a `failed` — so a pipeline never has
 to guess whether provenance was not requested, attempted and unproven, or proved:
+
+The same holds for `status`: `installed`, `skipped` (already on disk at that
+tag), `planned` (`--dry-run`) or `failed`, with `error` carrying the reason.
+A consumer never has to infer the outcome from which fields happen to be empty.
+
+## Batch install, and running it twice
+
+A tool list that has to be installed on a fresh machine is one command, and the
+second run costs nothing:
+
+```console
+$ ghfetch install --all jqlang/jq BurntSushi/ripgrep --dest /usr/local/bin
+[1/2] jqlang/jq
+jqlang/jq jq-1.8.2 -> jq-linux-amd64 (2.2 MiB)
+downloaded 2.2 MiB from ghfast.top
+checksum verified (sha256, from sha256sum.txt)
+installed /usr/local/bin/jq (2.2 MiB)
+[2/2] BurntSushi/ripgrep
+BurntSushi/ripgrep 15.2.0 -> ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz (2.2 MiB)
+downloaded 2.2 MiB from ghfast.top
+checksum verified (sha256, from ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz.sha256)
+note: "ripgrep" is not in ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz, using the largest executable instead
+installed /usr/local/bin/rg (5.2 MiB)
+2 installed, 0 skipped, 0 failed (of 2)
+
+$ ghfetch install --all jqlang/jq BurntSushi/ripgrep --dest /usr/local/bin
+[1/2] jqlang/jq
+jqlang/jq jq-1.8.2 is already installed at /usr/local/bin/jq (--force reinstalls)
+[2/2] BurntSushi/ripgrep
+BurntSushi/ripgrep 15.2.0 is already installed at /usr/local/bin/rg (--force reinstalls)
+0 installed, 2 skipped, 0 failed (of 2)
+```
+
+The second run is a no-op: nothing is downloaded, nothing is rewritten.
+
+- **One failure does not stop the list.** Every repository is attempted, the
+  failures are named at the end, and the exit status is `1`, so a provisioning
+  script fails loudly without leaving the rest of the list uninstalled.
+- **The record is what decides.** `~/.local/state/ghfetch/installed.json`
+  (override with `GHFETCH_STATE_FILE`, or `$XDG_STATE_HOME`) maps
+  `repo@destination` to the tag, the file it wrote and the sha256 of *that file*.
+  A repeat install is skipped only when the tag matches, the recorded path is
+  still inside the destination, and the bytes on disk still hash to the recorded
+  digest — a binary someone replaced by hand is installed again, not trusted.
+- **The version is never guessed** by running `<binary> --version`: projects
+  disagree about the flag, and a guess that parses wrong is worse than a
+  download.
+- **A pinned tag saves the download, not the API call.** Even with
+  `jq@jq-1.8.2` the release metadata is fetched to pick the asset; the skip
+  happens before the asset download, which is the part that is slow.
+
+Batch output for scripts:
+
+```console
+$ ghfetch install --all jqlang/jq ghost/nope --json | jq -c '.ok, (.results[] | {repo, status})'
+false
+{"repo":"jqlang/jq","status":"skipped"}
+{"repo":"ghost/nope","status":"failed"}
+```
+
+`--all --json` prints `{"ok": bool, "results": [...]}` with one entry per
+requested repository, in the order they were named, so the failures can be
+selected without parsing stderr.
 
 ## Shell completion
 
@@ -221,7 +287,8 @@ $ ghfetch install cli/cli --bin gh
   is a different tool with a different trust model.
 - **File names with spaces** in a checksum manifest are not parsed; no release
   artifact worth installing has one.
-- **No self-update.** Re-run `install`; the atomic rename makes that safe.
+- **No self-update.** Re-run `install`; a recorded tag is a no-op and a newer
+  tag replaces the binary through the same atomic rename.
 - **Mirrors are convenience, not trust.** Every mirror is treated as untrusted
   transport, which is exactly why the digest is verified after download rather
   than trusting the transport.
