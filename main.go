@@ -29,7 +29,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.5.0"
+var version = "0.6.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -48,6 +48,8 @@ func run(args []string) error {
 		return cmdInstall(args[1:])
 	case "list":
 		return cmdList(args[1:])
+	case "completion":
+		return cmdCompletion(args[1:])
 	case "version", "-v", "--version":
 		fmt.Printf("ghfetch %s (%s, %s)\n", version, runtime.Version(), platform.Detect())
 		return nil
@@ -65,6 +67,7 @@ func usage() {
 USAGE
   ghfetch install <owner/repo>[@tag] [flags]
   ghfetch list    <owner/repo>[@tag]
+  ghfetch completion <bash|zsh|fish>
   ghfetch version
   ghfetch help
 
