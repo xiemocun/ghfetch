@@ -71,6 +71,8 @@ ghfetch version
 | `--dest <dir>` | install directory (default: `/usr/local/bin`, else `~/.local/bin`) |
 | `--source <list>` | comma-separated mirror prefixes, `direct` to skip mirrors |
 | `--require-checksum` | fail when the release publishes no checksum file |
+| `--verify-attestation` | also verify SLSA build provenance with the `gh` CLI |
+| `--require-attestation` | fail unless build provenance verifies |
 | `--dry-run` | resolve and print the plan, install nothing |
 | `--json` | print a machine-readable report on stdout |
 
@@ -121,6 +123,30 @@ $ ghfetch install jqlang/jq --json
   "verified": "sha256"
 }
 ```
+
+## Supply chain: two independent checks
+
+A checksum answers *did these bytes arrive intact and as published*. It does not
+answer *did the publisher's build actually produce this file* — a compromised
+release upload passes a checksum happily.
+
+`ghfetch` therefore supports both, and they are independent:
+
+```console
+# 1. digest (always on when the release publishes one)
+$ ghfetch install xiemocun/ghfetch --require-checksum
+
+# 2. SLSA build provenance, verified by `gh attestation verify`
+$ ghfetch install xiemocun/ghfetch --require-attestation
+```
+
+Provenance verification is delegated to `gh attestation verify` rather than
+reimplemented: that command already ships Sigstore's trust roots, the Rekor
+lookup and the bundle format, and it is the verifier GitHub documents. Vendoring
+a TUF root store into a release installer would add more trust surface than the
+installer is worth. The trade-off is a dependency on `gh` (2.49+) for this one
+flag; without it, `--verify-attestation` warns and `--require-attestation`
+fails.
 
 ## What it supports
 

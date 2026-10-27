@@ -8,6 +8,10 @@ on:
 
 permissions:
   contents: write
+  # Needed to sign the build provenance attestation with a short-lived Sigstore
+  # certificate issued by GitHub (no key to manage, nothing to store).
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -44,6 +48,14 @@ jobs:
             done
           done
           (cd dist && sha256sum ./* > "ghfetch_${version}_checksums.txt")
+
+      - name: attest build provenance
+        uses: actions/attest@v4
+        with:
+          # Every archive and the checksum manifest become attested subjects:
+          # `gh attestation verify <file> --repo xiemocun/ghfetch` then proves
+          # the bytes were produced by this workflow, not just uploaded by hand.
+          subject-path: 'dist/*'
 
       - name: publish
         uses: softprops/action-gh-release@v2

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -28,7 +29,7 @@ import (
 )
 
 // version is set by the release build via -ldflags "-X main.version=...".
-var version = "0.3.0"
+var version = "0.4.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -74,7 +75,10 @@ INSTALL FLAGS
   --dest <dir>         install directory (default: /usr/local/bin, else ~/.local/bin)
   --source <list>      comma separated mirror prefixes, "direct" to skip mirrors
   --require-checksum   fail when the release publishes no checksum file
+  --verify-attestation verify SLSA build provenance with the gh CLI
+  --require-attestation fail unless build provenance verifies
   --dry-run            resolve and print the plan, install nothing
+  --json               machine readable report on stdout
 
 Set GH_TOKEN or GITHUB_TOKEN to raise the API rate limit.
 `)
@@ -89,6 +93,8 @@ func cmdInstall(args []string) error {
 	exact := fs.String("to", "", "exact asset filename")
 	sourceList := fs.String("source", "", "comma separated mirror prefixes")
 	needSum := fs.Bool("require-checksum", false, "fail when no checksum file is published")
+	verifyAtt := fs.Bool("verify-attestation", false, "also verify SLSA build provenance with the gh CLI")
+	requireAtt := fs.Bool("require-attestation", false, "fail unless build provenance verifies")
 	dryRun := fs.Bool("dry-run", false, "resolve only, install nothing")
 	asJSON := fs.Bool("json", false, "emit a machine readable report on stdout")
 	positional, err := parseInterspersed(fs, args)
@@ -175,6 +181,14 @@ func cmdInstall(args []string) error {
 		return err
 	}
 	report.Verified = method
+
+	if *verifyAtt || *requireAtt {
+		attestation, err := verifyAttestation(ctx, repo, data, *requireAtt)
+		if err != nil {
+			return err
+		}
+		report.Attestation = attestation
+	}
 
 	picked, body, mode, err := archive.Extract(data, asset.Name, want)
 	if err != nil && errors.Is(err, archive.ErrNotFound) {
@@ -286,6 +300,64 @@ func verify(ctx context.Context, chain *source.Chain, rel *ghrelease.Release, as
 	return "sha256", nil
 }
 
+// verifyAttestation checks the SLSA build provenance of the downloaded bytes.
+//
+// The signature work is delegated to `gh attestation verify` on purpose: that
+// command already carries Sigstore's trust roots, the Rekor lookup and the
+// bundle format, and it is the verifier GitHub documents. Reimplementing it
+// here would mean shipping a TUF root store inside an installer, which is a
+// much larger trust surface than the installer itself.
+func verifyAttestation(ctx context.Context, repo string, data []byte, require bool) (string, error) {
+	ghBin, err := exec.LookPath("gh")
+	if err != nil {
+		if require {
+			return "", errors.New("gh CLI not found in PATH; install it to verify build provenance")
+		}
+		fmt.Fprintln(os.Stderr, "warning: gh CLI not found, skipping provenance verification")
+		return "", nil
+	}
+
+	// gh matches attestations by the subject's digest, so the file name is
+	// irrelevant; the bytes are exactly the release asset.
+	tmp, err := os.CreateTemp("", "ghfetch-attest-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp file for attestation check: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, werr := tmp.Write(data); werr != nil {
+		tmp.Close()
+		return "", fmt.Errorf("write temp file for attestation check: %w", werr)
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return "", fmt.Errorf("close temp file for attestation check: %w", cerr)
+	}
+
+	out, err := exec.CommandContext(ctx, ghBin, "attestation", "verify", tmpName, "--repo", repo).CombinedOutput()
+	if err != nil {
+		detail := firstLine(string(out))
+		if require {
+			return "", fmt.Errorf("build provenance did not verify for %s: %s", repo, detail)
+		}
+		fmt.Fprintf(os.Stderr, "warning: build provenance did not verify (%s)\n", detail)
+		return "", nil
+	}
+	fmt.Fprintf(os.Stderr, "build provenance verified (gh attestation, %s)\n", repo)
+	return "verified", nil
+}
+
+// firstLine keeps an error report short when a verifier prints a paragraph.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "no output"
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
 // installBinary writes body next to its final path and renames it into place, so
 // a reader never observes a half-written executable.
 func installBinary(dir, name string, body []byte, mode os.FileMode) (string, error) {
@@ -325,18 +397,19 @@ func installBinary(dir, name string, body []byte, mode os.FileMode) (string, err
 // installReport, listReport and friends are the machine readable output of
 // --json. Field names are snake_case because shell and CI consumers read them.
 type installReport struct {
-	Repo       string   `json:"repo"`
-	Tag        string   `json:"tag"`
-	Asset      string   `json:"asset"`
-	Size       int64    `json:"size"`
-	Binary     string   `json:"binary"`
-	Dest       string   `json:"dest"`
-	Installed  string   `json:"installed,omitempty"`
-	Source     string   `json:"source,omitempty"`
-	SHA256     string   `json:"sha256,omitempty"`
-	Verified   string   `json:"verified,omitempty"`
-	Candidates []string `json:"candidates,omitempty"`
-	DryRun     bool     `json:"dry_run,omitempty"`
+	Repo        string   `json:"repo"`
+	Tag         string   `json:"tag"`
+	Asset       string   `json:"asset"`
+	Size        int64    `json:"size"`
+	Binary      string   `json:"binary"`
+	Dest        string   `json:"dest"`
+	Installed   string   `json:"installed,omitempty"`
+	Source      string   `json:"source,omitempty"`
+	SHA256      string   `json:"sha256,omitempty"`
+	Verified    string   `json:"verified,omitempty"`
+	Attestation string   `json:"attestation,omitempty"`
+	Candidates  []string `json:"candidates,omitempty"`
+	DryRun      bool     `json:"dry_run,omitempty"`
 }
 
 type hostReport struct {
